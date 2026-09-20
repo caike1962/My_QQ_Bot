@@ -1,0 +1,25 @@
+# ── Node 产物 ──
+node_modules/
+dist/
+
+# ── 调试残留与运行时状态 ──
+tmp/
+qq-bot/tmp-*
+qq-bot/workspace/
+qq-bot/sessions*.json*
+*.log
+
+# ── 敏感配置（含账号/密钥，不入库）──
+.claude/
+**/.env
+!**/.env.example
+qq-bot/mcp-config.json
+
+# ── NapCat 运行时（约 326MB 二进制/资源，仅保留自研启动脚本）──
+NapCat.Shell.Windows.Node/*
+!NapCat.Shell.Windows.Node/napcat/
+NapCat.Shell.Windows.Node/napcat/*
+!NapCat.Shell.Windows.Node/napcat/launch-hidden.vbs
+
+# Windows 快捷方式
+*.lnk

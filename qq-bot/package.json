@@ -1,0 +1,15 @@
+{
+  "name": "qq-bot",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "QQ 机器人守护进程：监听 NapCat 消息事件，spawn Claude Code 处理并回复",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"tests/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

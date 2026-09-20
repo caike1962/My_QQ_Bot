@@ -1,0 +1,35 @@
+{
+  "name": "onebot-mcp",
+  "version": "0.1.2",
+  "private": true,
+  "type": "module",
+  "description": "HTTP MCP server that wraps OneBot APIs for AI agents.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Frostbite-time/onebot-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Frostbite-time/onebot-mcp/issues"
+  },
+  "keywords": [
+    "onebot",
+    "mcp",
+    "qq-bot",
+    "napcat",
+    "llonebot",
+    "lagrange"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "test": "npm run build && node --test dist/tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "typescript": "^6.0.3"
+  }
+}

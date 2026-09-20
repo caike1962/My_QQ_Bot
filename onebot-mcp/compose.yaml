@@ -1,0 +1,26 @@
+services:
+  onebot-mcp:
+    image: ${ONEBOT_MCP_IMAGE:-ghcr.io/frostbite-time/onebot-mcp:latest}
+    environment:
+      ONEBOT_PLATFORM: ${ONEBOT_PLATFORM:?set ONEBOT_PLATFORM in .env}
+      ONEBOT_HTTP_URL: ${ONEBOT_HTTP_URL:-}
+      ONEBOT_WS_URL: ${ONEBOT_WS_URL:-}
+      ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
+      ONEBOT_ACTION_TIMEOUT_MS: ${ONEBOT_ACTION_TIMEOUT_MS:-10000}
+      ONEBOT_MCP_HOST: ${ONEBOT_MCP_HOST:-0.0.0.0}
+      ONEBOT_MCP_PORT: ${ONEBOT_MCP_PORT:-3000}
+      ONEBOT_MCP_PATH: ${ONEBOT_MCP_PATH:-/mcp}
+      ONEBOT_MCP_TOKEN: ${ONEBOT_MCP_TOKEN:-}
+      ONEBOT_MCP_ALLOWED_ORIGINS: ${ONEBOT_MCP_ALLOWED_ORIGINS:-}
+      ONEBOT_MCP_MAX_BODY_BYTES: ${ONEBOT_MCP_MAX_BODY_BYTES:-1048576}
+    ports:
+      - "${ONEBOT_MCP_BIND_HOST:-127.0.0.1}:${ONEBOT_MCP_PORT:-3000}:${ONEBOT_MCP_PORT:-3000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- \"http://127.0.0.1:$${ONEBOT_MCP_PORT:-3000}/healthz\" >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
