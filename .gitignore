@@ -7,6 +7,7 @@ tmp/
 qq-bot/tmp-*
 qq-bot/workspace/
 qq-bot/sessions*.json*
+qq-bot/roles.json
 *.log
 
 # ── 敏感配置（含账号/密钥，不入库）──

@@ -12,6 +12,80 @@ export class ClaudeError extends Error {
   }
 }
 
+// user 会话的附加提示词：纯聊天角色，无任何工具权限。
+// 重点声明两点：不存在授权弹窗（无头下被拒=永久没权限，别再请求批准，
+// 否则会陷入"要求用户点授权"的死循环）；绝不允许编造执行结果。
+const USER_SYSTEM_PROMPT =
+  "你是聊天机器人，只能聊天。你没有任何工具权限：不能读写文件、不能执行命令、不能操作 QQ（发消息、查群等）。" +
+  "如果对方要求你读文件、执行命令或代为操作，必须明确拒绝并说明没有权限。" +
+  "不存在授权弹窗：你不会得到任何新权限，不要请求对方批准，也不要重复尝试。" +
+  "不要编造执行结果——你从未执行过任何操作。";
+
+// user 会话绝不允许出现的参数。buildClaudeArgs 会做运行时断言 + 测试双保险，
+// 防止未来重构把 admin 的权限模式泄漏进受限会话。
+export const FORBIDDEN_ARGS_FOR_USER = [
+  "--dangerously-skip-permissions",
+  "--mcp-config",
+  "--strict-mcp-config",
+  "--allowedTools",
+];
+
+export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools }) {
+  const isUser = role === "user";
+  let args;
+  if (isUser) {
+    // default 权限模式 + 无白名单 + 无 MCP：无头场景下任何工具调用都会被硬拒绝，
+    // 会话退化为纯文本聊天。绝不能用 acceptEdits（允许写文件）或 bypass。
+    args = [
+      "-p",
+      prompt,
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "default",
+      "--append-system-prompt",
+      USER_SYSTEM_PROMPT,
+    ];
+  } else {
+    args = [
+      "-p",
+      prompt,
+      "--output-format",
+      "json",
+      "--mcp-config",
+      mcpConfigPath,
+      "--strict-mcp-config",
+      // 完全 bypass —— 用户明确选择（admin 会话）。
+      //
+      // 已实测确认：bypass 会**完全绕过** --allowedTools。给白名单只留
+      // Read/Glob/Grep 时，仍能执行 Bash（whoami 返回 Administrator），
+      // 且 permission_denials 为空。
+      //
+      // 因此 QQ_ALLOWED_TOOLS 在 bypass 下**不再构成安全边界**，保留它只是
+      // 为了记录意图。真正的边界是发送者角色：QQ_ALLOWED_SENDERS（admin）。
+      //
+      // 若要收窄，改回 "--permission-mode", "acceptEdits"，白名单即重新生效。
+      "--dangerously-skip-permissions",
+      "--allowedTools",
+      allowedTools,
+    ];
+  }
+
+  if (sessionId) {
+    args.push("--resume", sessionId);
+  }
+
+  if (isUser) {
+    for (const flag of FORBIDDEN_ARGS_FOR_USER) {
+      if (args.includes(flag)) {
+        throw new Error(`user 会话参数泄漏: ${flag} 不允许出现在受限参数中`);
+      }
+    }
+  }
+
+  return args;
+}
+
 // claude.exe is a self-contained binary (pkg-style), so it can be spawned
 // directly without a shell. This is what keeps QQ message text from ever
 // reaching cmd.exe, where characters like & and | would be interpreted.
@@ -27,34 +101,9 @@ export function runClaude({
   allowedTools,
   timeoutMs,
   mcpTimeoutMs,
+  role = "admin",
 }) {
-  const args = [
-    "-p",
-    prompt,
-    "--output-format",
-    "json",
-    "--mcp-config",
-    mcpConfigPath,
-    "--strict-mcp-config",
-    // 完全 bypass —— 用户明确选择。
-    //
-    // 已实测确认：bypass 会**完全绕过** --allowedTools。给白名单只留
-    // Read/Glob/Grep 时，仍能执行 Bash（whoami 返回 Administrator），
-    // 且 permission_denials 为空。
-    //
-    // 因此 config.js 里的 QQ_ALLOWED_TOOLS 在 bypass 下**不再构成安全边界**，
-    // 保留它只是为了记录意图。真正的边界是 QQ_ALLOWED_SENDERS ——
-    // 谁能给 bot 发消息，谁就能以 Administrator 权限在这台机器上执行任意命令。
-    //
-    // 若要收窄，改回 "--permission-mode", "acceptEdits"，白名单即重新生效。
-    "--dangerously-skip-permissions",
-    "--allowedTools",
-    allowedTools,
-  ];
-
-  if (sessionId) {
-    args.push("--resume", sessionId);
-  }
+  const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools });
 
   // Working directory decides which project the session lands in, so a bad
   // value silently scatters sessions across the wrong folders.

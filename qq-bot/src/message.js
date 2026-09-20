@@ -68,7 +68,32 @@ export function isBotMentioned(message, { selfId, names = [] } = {}) {
   return false;
 }
 
-export function shouldHandle(event, config) {
+// 发送者角色：admin（QQ_ALLOWED_SENDERS，现状语义不变）、user（roles.json 名单）、null（陌生人）。
+// 兼容遗留语义：allowedSenders 为空（= 不限制）时一律按 admin 处理。
+export function senderRole(userId, config, roles = {}) {
+  const id = Number(userId);
+  if (config.allowedSenders.length) {
+    if (config.allowedSenders.includes(id)) return "admin";
+    return roles.isUser?.(id) ? "user" : null;
+  }
+  return "admin";
+}
+
+// Admin 专属的权限管理指令。走代码路径而非模型路径：
+// 该模型在工具被拒时可能"编造"执行结果，加人这种权限操作必须确定性执行。
+const ADD_USER_RE = /^将\s*(\d{5,12})\s*添加为\s*用户$/;
+const REMOVE_USER_RE = /^将\s*(\d{5,12})\s*移出\s*用户$/;
+
+export function parseRoleCommand(text) {
+  const t = (text || "").trim();
+  let m = t.match(ADD_USER_RE);
+  if (m) return { action: "add", qq: Number(m[1]) };
+  m = t.match(REMOVE_USER_RE);
+  if (m) return { action: "remove", qq: Number(m[1]) };
+  return null;
+}
+
+export function shouldHandle(event, config, roles = {}) {
   if (!event || typeof event !== "object") return false;
   if (event.post_type !== "message") return false;
 
@@ -78,9 +103,7 @@ export function shouldHandle(event, config) {
   if (event.self_id !== undefined && Number(event.self_id) !== config.selfId) return false;
 
   if (event.message_type === "private") {
-    if (config.allowedSenders.length && !config.allowedSenders.includes(userId)) {
-      return false;
-    }
+    if (!senderRole(userId, config, roles)) return false;
     return true;
   }
 
@@ -91,10 +114,8 @@ export function shouldHandle(event, config) {
     if (config.allowedGroups.length && !config.allowedGroups.includes(groupId)) {
       return false;
     }
-    // 私有部署下，群里按发送人白名单控制，避免任何群成员都能驱动机器人
-    if (config.allowedSenders.length && !config.allowedSenders.includes(userId)) {
-      return false;
-    }
+    // 私有部署下，群里按发送人角色控制，避免任何群成员都能驱动机器人
+    if (!senderRole(userId, config, roles)) return false;
     // 群聊只在真的 @ 了机器人时才响应（at 段 / CQ 码，或文本开头的群昵称）
     if (
       !isBotMentioned(event.message, {

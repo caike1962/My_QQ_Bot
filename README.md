@@ -77,13 +77,15 @@ MCP HTTP 端点为 `http://127.0.0.1:3000/mcp`。工具名与底层 OneBot API �
 
 ## 安全边界（重要）
 
-- qq-bot spawn claude 使用 `--dangerously-skip-permissions`，**工具白名单不构成边界**；`QQ_ALLOWED_SENDERS`（谁能触发 bot）是唯一真实边界，须保持非空且只含机主 QQ——任何人给它发消息即等于在本机以 Administrator 执行命令
-- 密钥与账号配置全部不入库：`onebot-mcp/.env`、`qq-bot/mcp-config.json`、NapCat `config/` 需在部署机上手工创建
-- 群聊 @ 识别依赖 `QQ_GROUP_MENTION_NAMES`，机器人改群昵称后必须同步，否则表现为「完全没反应」（连日志都没有）
+- 发送者分为两个角色：**admin**（`QQ_ALLOWED_SENDERS`，默认只含机主）与 **user**（`qq-bot/roles.json`，不提交）。admin 拥有全部权限；user 只能纯聊天——spawn 时以 `--permission-mode default` + 无 MCP + 无工具白名单运行，任何工具调用都会被硬拒绝（`tests/claude-spawn.test.js` 是这条边界的回归红线）
+- **角色管理指令**（仅 admin 可用，由代码确定性执行、不经过模型）：私聊或群里 @ 机器人说「将 12345678 添加为用户」/「将 12345678 移出用户」即可增删 user，结果写入 `roles.json` 即时生效
+- admin 会话使用 `--dangerously-skip-permissions`，**工具白名单不构成边界**；真正决定谁能干什么的是角色名单
+- 密钥与账号配置全部不入库：`onebot-mcp/.env`、`qq-bot/mcp-config.json`、`qq-bot/roles.json`、NapCat `config/` 需在部署机上手工创建/生成
 
 ## 已知行为备忘
 
 - 开机后约 40~60s 内 NapCat 未登录、3001 未监听，qq-bot 日志刷 `连接关闭 code=1006` 属正常，会自动递增重连
+- 群聊 @ 识别依赖 `QQ_GROUP_MENTION_NAMES`，机器人改群昵称后必须同步，否则表现为「完全没反应」（连日志都没有）
 - 从机器人账号给自己发消息不会触发处理（`userId === selfId` 被过滤），联调要用另一个 QQ 号
 - 排查顺序：3000（MCP 活着吗）→ 3001（NapCat 登录了吗）→ 6099（WebUI loginPhase/loginError）
 

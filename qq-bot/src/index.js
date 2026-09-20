@@ -2,10 +2,12 @@ import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
-import { extractText, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned } from "./message.js";
+import { extractText, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, parseRoleCommand } from "./message.js";
 import { sessionPath, stripImages } from "./session.js";
+import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
+const roles = { isUser };
 const config = loadConfig();
 
 const SESSIONS_PATH = "D:\\QQBOT\\qq-bot\\sessions.json";
@@ -79,15 +81,15 @@ const queues = new Map();
 let client;
 
 function onEvent(event) {
-  if (shouldHandle(event, config)) {
+  if (shouldHandle(event, config, roles)) {
     enqueue(event);
   } else if (event?.post_type === "message") {
     // 记录未处理消息的原因，便于排查"机器人为什么不理我"
     const uid = Number(event.user_id);
     if (event.message_type === "group") {
       if (!config.enableGroups) return;
-      if (config.allowedSenders.length && !config.allowedSenders.includes(uid)) {
-        log(`忽略群消息：${uid} 不在发送人白名单`);
+      if (!senderRole(uid, config, roles)) {
+        log(`忽略群消息：${uid} 不在角色名单（admin/user）`);
       } else if (
         !isBotMentioned(event.message, {
           selfId: config.selfId,
@@ -96,8 +98,8 @@ function onEvent(event) {
       ) {
         log(`忽略群消息：${uid} 未 @ 机器人`);
       }
-    } else if (config.allowedSenders.length && !config.allowedSenders.includes(uid)) {
-      log(`忽略私聊：${uid} 不在发送人白名单`);
+    } else if (!senderRole(uid, config, roles)) {
+      log(`忽略私聊：${uid} 不在角色名单（admin/user）`);
     }
   }
 }
@@ -131,6 +133,40 @@ async function handleMessage(event) {
     return;
   }
 
+  // 角色管理指令（仅 Admin 可执行）。拦截在模型路径之前：
+  // 加人/移除这种权限操作由代码确定性执行，不能交给模型转述
+  // （该模型在工具被拒时会"编造"执行结果，例如假装已写入名单）。
+  const role = senderRole(userId, config, roles);
+  const roleCmd = parseRoleCommand(text);
+  if (roleCmd) {
+    if (role !== "admin") {
+      await reply("你没有权限管理用户名单。").catch((e) => log("发送权限提示失败: " + e.message));
+      return;
+    }
+    const qq = roleCmd.qq;
+    if (qq === userId || qq === config.selfId) {
+      await reply(`${qq} 不需要也不应该进入用户名单。`).catch((e) => log("发送提示失败: " + e.message));
+      return;
+    }
+    try {
+      if (roleCmd.action === "add") {
+        const added = addUser(qq);
+        await reply(
+          added
+            ? `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。`
+            : `${qq} 已在用户名单中。`,
+        );
+      } else {
+        const removed = removeUser(qq);
+        await reply(removed ? `已将 ${qq} 移出用户名单。` : `${qq} 不在用户名单中。`);
+      }
+    } catch (error) {
+      log(`修改用户名单失败: ${error.message}`);
+      await reply(`修改用户名单失败：${String(error.message).slice(0, 120)}`);
+    }
+    return;
+  }
+
   if (text.length > config.maxPromptChars) {
     await reply(`消息太长了（${text.length} 字），请控制在 ${config.maxPromptChars} 字以内。`);
     return;
@@ -151,6 +187,7 @@ async function handleMessage(event) {
       allowedTools: config.allowedTools,
       timeoutMs: config.timeoutMs,
       mcpTimeoutMs: config.mcpTimeoutMs,
+      role,
     });
 
   let result;
@@ -266,8 +303,10 @@ client = new OneBotWsClient({
 });
 
 log(
-  `启动: bot=${config.selfId} 白名单=[${config.allowedSenders.join(",") || "全部"}] ` +
-    `群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}])` : ""} ` +
+  `启动: bot=${config.selfId} 角色管理=开` +
+    ` admin=[${config.allowedSenders.join(",") || "无(全部按 admin)"}]` +
+    ` user=[${loadRoles().users.join(",") || "无"}]` +
+    ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}])` : ""} ` +
     `工具数=${config.allowedTools.split(",").length} 超时=${config.timeoutMs / 1000}s`,
 );
 client.connect();

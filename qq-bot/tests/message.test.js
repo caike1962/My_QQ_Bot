@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractText, shouldHandle, stripLeadingMention, isBotMentioned } from "../src/message.js";
+import {
+  extractText,
+  shouldHandle,
+  stripLeadingMention,
+  isBotMentioned,
+  senderRole,
+  parseRoleCommand,
+} from "../src/message.js";
 
 // ---------- extractText ----------
 
@@ -274,4 +281,70 @@ test("shouldHandle: 群里文本 @昵称 开头通过", () => {
 
 test("shouldHandle: 群里字符串 CQ at 通过", () => {
   assert.equal(shouldHandle(groupEvent({ message: "[CQ:at,qq=3126747682] 你好" }), GROUP_CFG), true);
+});
+
+// ---------- senderRole ----------
+
+const ROLES = { isUser: (id) => id === 88888888 };
+
+test("senderRole: admin 名单内为 admin", () => {
+  assert.equal(senderRole(1765116032, CONFIG, ROLES), "admin");
+});
+
+test("senderRole: roles.json 名单内为 user", () => {
+  assert.equal(senderRole(88888888, CONFIG, ROLES), "user");
+});
+
+test("senderRole: 两者都不在返回 null", () => {
+  assert.equal(senderRole(999999, CONFIG, ROLES), null);
+});
+
+test("senderRole: 非法 user_id 返回 null", () => {
+  for (const bad of [null, undefined, 0, -1, "abc", 1.5]) {
+    assert.equal(senderRole(bad, CONFIG, ROLES), null, `user_id=${bad}`);
+  }
+});
+
+test("senderRole: allowedSenders 为空时一律 admin（兼容遗留语义）", () => {
+  const open = { allowedSenders: [] };
+  assert.equal(senderRole(123456, open, ROLES), "admin");
+});
+
+test("shouldHandle: user 名单内私聊通过", () => {
+  assert.equal(shouldHandle(msgEvent({ user_id: 88888888 }), CONFIG, ROLES), true);
+});
+
+test("shouldHandle: user 名单内群里 @ 通过", () => {
+  assert.equal(shouldHandle(groupEvent({ user_id: 88888888 }), GROUP_CFG, ROLES), true);
+});
+
+test("shouldHandle: 陌生人（非 admin 非 user）在群里 @ 也拒绝", () => {
+  assert.equal(shouldHandle(groupEvent({ user_id: 999999 }), GROUP_CFG, ROLES), false);
+});
+
+// ---------- parseRoleCommand ----------
+
+test("parseRoleCommand: 添加用户", () => {
+  assert.deepEqual(parseRoleCommand("将 12345678 添加为用户"), { action: "add", qq: 12345678 });
+});
+
+test("parseRoleCommand: 添加用户容忍多余空白", () => {
+  assert.deepEqual(parseRoleCommand("  将  12345678 添加为 用户  "), {
+    action: "add",
+    qq: 12345678,
+  });
+});
+
+test("parseRoleCommand: 全角空格也能解析", () => {
+  assert.deepEqual(parseRoleCommand("将　12345678　添加为用户"), { action: "add", qq: 12345678 });
+});
+
+test("parseRoleCommand: 移出用户", () => {
+  assert.deepEqual(parseRoleCommand("将 12345678 移出用户"), { action: "remove", qq: 12345678 });
+});
+
+test("parseRoleCommand: 无效输入返回 null", () => {
+  for (const bad of ["", "把 123 添加为用户", "将 abc 添加为用户", "将 123 添加为管理员", "添加 12345678 为用户", "你好"]) {
+    assert.equal(parseRoleCommand(bad), null, `输入 "${bad}" 应返回 null`);
+  }
 });
