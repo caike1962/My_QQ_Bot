@@ -188,6 +188,34 @@ export function readSessionDelta(filePath, fromLine = 0, { limit = MAX_CALLS } =
   };
 }
 
+// 会话最后一条记录的 type。
+//
+// 用途：判断某个"待确认"的队列条目到底是真丢了任务、还是通知误报。
+// 跑过 claude 的那轮，收尾一定会写一条 cost-state（实测 6 条会话里
+// 5 条以它结尾；唯一例外正是"结果已发出、CLI 在写它之前被杀"的那种）。
+// 而压根没执行过的消息（命令类、入队即被杀），会话末尾会停在更早以前。
+//
+// 这一条判据就能把"误报"和"真丢"分开——比内容判据（sessionCompleted）
+// 更贴近"这轮到底跑没跑"本身。
+export function lastRecordType(filePath) {
+  if (!existsSync(filePath)) return null;
+  let lines;
+  try {
+    lines = readFileSync(filePath, "utf8").trimEnd().split("\n");
+  } catch {
+    return null;
+  }
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const rec = JSON.parse(lines[i]);
+      if (rec?.type) return rec.type;
+    } catch {
+      /* 解析不了的整行跳过 */
+    }
+  }
+  return null;
+}
+
 // 把一次运行的调用记录压成给用户看的几行摘要。
 //
 // 只显示**最后一个悬空工具之后**的调用，悬空的那个本身**不显示**：

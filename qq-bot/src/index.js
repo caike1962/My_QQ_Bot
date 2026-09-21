@@ -3,7 +3,7 @@ import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
 import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
-import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount } from "./session.js";
+import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
@@ -1082,11 +1082,41 @@ async function restoreQueue() {
 
   const queued = entries.filter((e) => e.status === "queued");
   const interrupted = entries.filter((e) => e.status === "running");
-  // "notified" 是终态：用户已经被告知过，还没回「继续」。不再重复通知——
-  // 否则每次重启都对着同一批消息唠叨一遍（实测被烦了两次才发现）。
-  const waiting = entries.filter((e) => e.status !== "queued" && e.status !== "running");
-  if (waiting.length) {
-    log(`${waiting.length} 条消息在等用户回「继续」，不再重复通知`);
+  // notified：已经告知过用户，等他回「继续」。
+  //
+  // 但这个状态有两种来源，含义完全相反，必须分开处理：
+  //   a) 通知本身是**误报** —— 任务早已跑完（命令类消息压根不写会话，
+  //      或结果发完了只是没来得及摘除）。这类会永久堆积，要清掉。
+  //   b) 任务**确实**没跑完 —— 用户还没决定要不要重放。替他做决定
+  //      （无论是重放还是丢弃）都是错的，只能保持不动。
+  //
+  // 区分依据：通读会话的最后一条记录。真正跑过 claude 的那轮，
+  // 末尾一定会留下 cost-state（实测 6 条会话里 5 条以它结尾，唯一
+  // 例外正是"结果已发出、CLI 在写它之前被杀"的那种）；而误报的那些
+  // 会话末尾停在更早以前，说明这轮根本没执行过。
+  const awaiting = entries.filter((e) => e.status !== "queued" && e.status !== "running");
+  let cleanedNotified = 0;
+  let keptNotified = 0;
+
+  for (const e of awaiting) {
+    // 条目的事件只活这一次恢复：若不重建映射，用户回「继续」时
+    // handleRetry 查 pendingRetry 会落空，「继续」被当成普通聊天词吞掉。
+    // 之前这些条目只是"被跳过"，所以这个漏洞一直没暴露。
+    pendingRetry.set(e.key, e.event);
+
+    const sid = sessions.get(e.key);
+    const last = sid ? lastRecordType(sessionPath(PROJECT_DIR, sid)) : null;
+    if (last === "cost-state") {
+      log(`丢弃 ${e.key} 的误报条目：会话里这轮已完整跑完（末条=${last}）`);
+      removePending(e.id);
+      cleanedNotified++;
+      continue;
+    }
+    keptNotified++;
+  }
+
+  if (cleanedNotified || keptNotified) {
+    log(`通知队列：清理 ${cleanedNotified} 条误报，保留 ${keptNotified} 条待用户决定`);
   }
 
   for (const e of queued) {
@@ -1102,10 +1132,12 @@ async function restoreQueue() {
     // 而进程被强杀时，绝大多数任务其实已经在会话文件里跑完了（结果都发出去了）。
     // 无脑通知会让每次重启都误报一次，用户很快就不看了，真正的丢消息反被淹没。
     const sid = sessions.get(e.key);
-    const completed = sid
-      ? sessionCompleted(sessionPath(PROJECT_DIR, sid))
-      : null;
-    if (completed === true) {
+    const path = sid ? sessionPath(PROJECT_DIR, sid) : null;
+    const last = path ? lastRecordType(path) : null;
+    // 末条是 cost-state = 完整跑完；或旧判据（末尾有正式回复文本）也认。
+    // 两个判据都只看"有没有跑完"，任一成立即可静默清理。
+    const completed = last === "cost-state" || (path && sessionCompleted(path) === true);
+    if (completed) {
       log(`丢弃 ${e.key} 的残留条目：会话里这轮已经跑完（结果早已发出）`);
       removePending(e.id);
       continue;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary } from "../src/session.js";
+import { stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, lastRecordType } from "../src/session.js";
 
 const BIG = "A".repeat(50_000); // 模拟 base64 图片
 
@@ -507,4 +507,50 @@ test("pendingSummary: max 限制的是列出的步骤数", () => {
 test("pendingSummary: 空或 null 返回空串，不抛错", () => {
   assert.equal(pendingSummary(null), "");
   assert.equal(pendingSummary({ calls: [], dangling: [] }), "");
+});
+
+// ---------- lastRecordType ----------
+//
+// 判据：跑过 claude 的那轮，收尾一定会写 cost-state。
+// 用来把「通知误报」和「真丢了任务」分开。
+
+test("lastRecordType: 正常跑完的会话末条是 cost-state", () => {
+  withTempFile(
+    [asst([text("说完了")]), { type: "last-prompt" }, { type: "cost-state" }],
+    (f) => assert.equal(lastRecordType(f), "cost-state"),
+  );
+});
+
+test("lastRecordType: 压根没执行过的会话末条不是 cost-state", () => {
+  // 实测：某条真丢任务的会话末尾是 attachment
+  withTempFile([asst([toolUse("Bash")]), { type: "attachment" }], (f) => {
+    assert.notEqual(lastRecordType(f), "cost-state");
+    assert.equal(lastRecordType(f), "attachment");
+  });
+});
+
+test("lastRecordType: 损坏行被跳过，取最后一个可解析的", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-test-"));
+  const file = join(dir, "s.jsonl");
+  writeFileSync(file, [JSON.stringify({ type: "cost-state" }), "{坏行"].join("\n"));
+  try {
+    assert.equal(lastRecordType(file), "cost-state");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("lastRecordType: 文件不存在返回 null", () => {
+  assert.equal(lastRecordType("D:/definitely/not/here.jsonl"), null);
+});
+
+test("lastRecordType: 空文件返回 null", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-test-"));
+  const file = join(dir, "empty.jsonl");
+  writeFileSync(file, "");
+  try {
+    assert.equal(lastRecordType(file), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
