@@ -96,7 +96,7 @@ export const FORBIDDEN_ARGS_FOR_USER = [
   "--allowedTools",
 ];
 
-export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools, model }) {
+export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools, model, maxTurns }) {
   const isUser = role === "user";
   let args;
   if (isUser) {
@@ -147,6 +147,13 @@ export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPa
     args.push("--model", model);
   }
 
+  // 轮次上限。这是兜底护栏：模型陷入循环时（反复读同一个文件、工具报错后
+  // 重试）会一直烧下去，而超时是 5 分钟起步的粗粒度闸门，等它触发时
+  // 已经白跑很久。不传则用 CLI 自己的默认值。
+  if (maxTurns > 0) {
+    args.push("--max-turns", String(maxTurns));
+  }
+
   if (isUser) {
     for (const flag of FORBIDDEN_ARGS_FOR_USER) {
       if (args.includes(flag)) {
@@ -171,6 +178,7 @@ export function runClaude({
   prompt,
   sessionId,
   allowedTools,
+  maxTurns,
   timeoutMs,
   mcpTimeoutMs,
   role = "admin",
@@ -178,7 +186,7 @@ export function runClaude({
   abortSignal,
   label,
 }) {
-  const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools, model });
+  const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools, model, maxTurns });
 
   // Working directory decides which project the session lands in, so a bad
   // value silently scatters sessions across the wrong folders.

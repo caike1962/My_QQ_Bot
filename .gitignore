@@ -9,6 +9,7 @@ qq-bot/workspace/
 qq-bot/sessions*.json*
 qq-bot/roles.json
 qq-bot/queue.json*
+qq-bot/bg-tasks.json*
 qq-bot/jobs.json*
 *.log
 

@@ -8,6 +8,7 @@ import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, se
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
+import { BG_PREFIX_RE, parseBgCommand, parseNaturalTrigger, setBgPath, setBgLogger, loadTasks, addTask, updateTask, peekResults, consumeResult, markDelivered, sweepInterrupted, admit, counts, formatResultBlock, runBackgroundTask } from "./bg.js";
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
 import { formatHistory, historyBody } from "./history.js";
@@ -25,6 +26,8 @@ const config = loadConfig();
 // 一半的文件（sessions/jobs 跟着走，queue/roles 留在原地）。
 setQueuePath(config.queuePath);
 setRolesPath(config.rolesPath);
+setBgPath(config.bgTasksPath);
+setBgLogger((msg) => log(msg));
 
 // 会话键统一在这里取，避免各处重复传配置。群聊是否按群共享见 config.groupSharedSession。
 const convKey = (event) => conversationKey(event, { groupShared: config.groupSharedSession });
@@ -234,20 +237,25 @@ const historyCache = new Map();
 const HISTORY_TTL_MS = 30_000;
 const HISTORY_MAX_KEYS = 10;
 
-// 拉取并格式化某群最近的消息。任何失败都返回空数组——
+// 拉取并格式化某会话最近的消息。任何失败都返回空数组——
 // 这是锦上添花的上下文，绝不能因为它失败就让整条消息处理不下去。
-async function recentHistory(groupId) {
-  const key = String(groupId);
+//
+// 私聊走 get_private_message_history：后台任务跑在全新会话里、对「刚才聊的
+// 那些」零上下文，补上这段能显著提升任务完成质量。群聊沿用原有的回溯。
+async function recentHistory(id, { isGroup = true } = {}) {
+  const key = isGroup ? `g${id}` : `p${id}`;
   const hit = historyCache.get(key);
   if (hit && Date.now() - hit.at < HISTORY_TTL_MS) return hit.lines;
 
   let lines = [];
   try {
-    const res = await client.action("get_group_msg_history", { group_id: Number(groupId) });
+    const res = isGroup
+      ? await client.action("get_group_msg_history", { group_id: Number(id) })
+      : await client.action("get_private_message_history", { user_id: Number(id) });
     const msgs = res?.data?.messages ?? res?.data;
     lines = formatHistory(msgs, { selfId: config.selfId });
   } catch (error) {
-    log(`拉取群 ${groupId} 历史失败（本次不带上下文）: ${error.message}`);
+    log(`拉取 ${isGroup ? "群" : "私聊"} ${id} 历史失败（本次不带上下文）: ${error.message}`);
   }
 
   historyCache.set(key, { lines, at: Date.now() });
@@ -491,7 +499,7 @@ function shouldSendAsFile(len) {
 //
 // 返回 true 表示文件已送达（调用方就不必再发正文了）；
 // false 表示没送成，调用方必须退回常规路径——**绝不能静默丢内容**。
-async function sendLongReplyAsFile({ event, key, text, len }) {
+async function sendLongReplyAsFile({ event, key, text, len, notice: noticeOf }) {
   const at = Date.now();
   let path;
   try {
@@ -526,7 +534,8 @@ async function sendLongReplyAsFile({ event, key, text, len }) {
   //
   // 用 replyTo 而不是 handleMessage 里那个局部 reply()：这个函数在模块
   // 作用域，拿不到那个闭包。replyTo 的行为一致（同样处理群聊 @）。
-  const notice = `内容较长（${len} 字），已整理成文件，用浏览器打开即可阅读。`;
+  const notice =
+    noticeOf || `内容较长（${len} 字），已整理成文件，用浏览器打开即可阅读。`;
   try {
     const r = await replyTo(event, notice);
     if (r?.status !== "ok") log(`发送文件说明失败: ${JSON.stringify(r)}`);
@@ -675,6 +684,8 @@ async function collectDiagnostic(mergeWindowMs) {
     execs: execList,
     queueEntries: entries.slice(0, 30),
     queueTotal: entries.length,
+    // 后台任务单列一节：它**不占用会话**，混进【执行】会让人误以为聊天被堵住
+    background: loadTasks().filter((t) => t.status === "running" || !t.injected).slice(0, 20),
     // 压缩中的会话单列一节：它解释"为什么这条会话的下一条会慢"
     compacting: [...compacting.entries()].map(([k, v]) => ({
       key: k,
@@ -694,6 +705,7 @@ async function collectDiagnostic(mergeWindowMs) {
       pendingFiles: pendingFiles.size,
       staleFiles,
       pendingRetry: pendingRetry.size,
+      bgPending: counts().pendingInject.length,
       workspace: workspaceStatus(),
     },
     sessions: {
@@ -816,11 +828,296 @@ function onEvent(event) {
   }
 }
 
-// 把名字解析成 QQ 号——**兜底路径**，只在 at 段也没给出号码时才走到这里
-// （QQ 把 @ 转成纯文本时号码会彻底消失，只剩昵称）。
+// —— 后台任务 ——
+
+// 正在跑的后台任务：taskId → { controller, task }。
 //
-// 返回 undefined 表示"没解析出来"——调用方据此静默退回模型路径，
-// 不要在这里替用户做决定（加错人比不加人严重得多）。
+// 与 execs 是两回事：execs 锁的是一个**会话**（同一时刻只能有一个 claude
+// 碰那个会话文件），而后台任务跑在自己的独立会话里，压根不该进 execs——
+// 进了就会把该会话的聊天全堵住，恰好毁掉这个功能。
+const bgRunning = new Map();
+
+// 组装后台任务的 prompt：历史在前、任务在后（同群聊回溯的顺序，
+// 模型读到最后那句时手里已经有背景了）。
+function bgPromptFor(task, historyLines) {
+  const body = historyBody(historyLines);
+  if (!body) return task.prompt;
+
+  // 历史是背景，任务是主体。背景太长就丢背景、保任务——
+  // 绝不能因为「过去聊了什么」太长而拒绝执行「现在要做什么」。
+  if (body.length > config.maxPromptChars / 2) {
+    log(`后台任务的会话历史过长（${body.length} 字），本次不带历史`);
+    return task.prompt;
+  }
+  return `${body}\n\n[当前任务] ${task.prompt}`;
+}
+
+// 结果推送到聊天窗口。走 sendWhenConnected 而不是裸 client.action：
+// 结果可能正好落在 WS 重连窗口里，那时候丢掉就等于任务白跑。
+async function deliverBgResult(task) {
+  const isGroup = String(task.conv).startsWith("group:");
+  const id = Number(String(task.conv).split(":")[1]);
+  const text = String(task.result?.text || "");
+  const len = Array.from(text).length;
+
+  const event = isGroup
+    ? { message_type: "group", group_id: id, user_id: config.selfId }
+    : { message_type: "private", user_id: id };
+
+  // 长结果走既有的 HTML 文件通道，但通知里带一段预览——
+  // 用户为这个任务等了半天，只回一句「见文件」体验太差。
+  if (shouldSendAsFile(len)) {
+    const preview = Array.from(text).slice(0, 600).join("");
+    const ok = await sendLongReplyAsFile({
+      event,
+      key: task.conv,
+      text,
+      len,
+      notice: `${preview}\n\n（完整内容已整理成文件，共 ${len} 字，打开即可阅读）`,
+    }).catch((e) => {
+      log(`后台任务结果发文件失败: ${e.message}`);
+      return false;
+    });
+    if (ok) return true;
+  }
+
+  const body = truncatedReply(text, len);
+  try {
+    const sent = await sendWhenConnected(
+      isGroup ? "send_group_msg" : "send_private_msg",
+      isGroup ? { group_id: id, message: body } : { user_id: id, message: body },
+    );
+    return sent?.status === "ok";
+  } catch (error) {
+    log(`后台任务结果推送失败: ${error.message}`);
+    return false;
+  }
+}
+
+async function runBgTask(task) {
+  const controller = new AbortController();
+  bgRunning.set(task.id, { controller, task });
+
+  try {
+    let historyLines = [];
+    try {
+      const isGroup = String(task.conv).startsWith("group:");
+      const id = Number(String(task.conv).split(":")[1]);
+      historyLines = await recentHistory(id, { isGroup });
+    } catch (error) {
+      log(`后台任务拉取会话历史失败（不带历史继续）: ${error.message}`);
+    }
+
+    const lines = historyLines.slice(-config.bgHistoryLimit);
+    const prompt = bgPromptFor(task, lines);
+    log(`后台任务 ${task.id} 开始: ${truncate(task.prompt, 40)}（历史 ${lines.length} 条，prompt ${prompt.length} 字）`);
+
+    // 历史已经拼进 prompt 了，这里不再重复传——bg.js 的 history 参数是给
+    // 调用方的另一条路（由它自己拼），两处都传会重复。
+    const { text, cost } = await runBackgroundTask({
+      task: { ...task, prompt },
+      config,
+      log,
+      abortSignal: controller.signal,
+      runClaude,
+    });
+
+    updateTask(task.id, {
+      status: "done",
+      result: { ok: true, text, file: null, at: Date.now(), cost },
+    });
+    log(`后台任务 ${task.id} 完成（${text.length} 字）`);
+  } catch (error) {
+    // 被取消：条目已由 /bg 取消 那条路径处理过，这里不再覆盖结果
+    if (error?.aborted) {
+      log(`后台任务 ${task.id} 已取消`);
+      return;
+    }
+    log(`后台任务 ${task.id} 失败: ${error.message}`);
+    updateTask(task.id, {
+      status: "done",
+      result: { ok: false, text: `任务执行失败：${String(error.message).slice(0, 300)}`, file: null, at: Date.now(), cost: 0 },
+    });
+  } finally {
+    bgRunning.delete(task.id);
+  }
+
+  // 推送与「已送达」标记：先标记再发送，与 queue.js 的 notify 同理——
+  // 反过来的话，在两者之间被强杀会导致竞态。这里顺序相反是刻意的：
+  // 发送失败时保持 delivered:false，结果仍留在文件里等下次注入。
+  const done = loadTasks().find((t) => t.id === task.id);
+  if (!done || done.delivered) return;
+
+  const sent = await deliverBgResult(done);
+  if (sent) {
+    markDelivered(task.id);
+    log(`后台任务 ${task.id} 结果已推送`);
+  } else {
+    log(`后台任务 ${task.id} 结果推送失败，留待下次注入`);
+  }
+}
+
+// 取一条待注入的后台结果，并做消费决策。
+//
+// peek 与 consume 分开、且只有长度检查通过才消费：直接照抄旁边文件缓存的
+// 教训（先检查再 takeFiles），反过来会写出「检查失败却把缓存吃掉了」的 bug。
+function takeBgResult(key, baseText) {
+  const hit = peekResults(key, { ttlMs: config.bgResultTtlMs });
+  if (!hit) return null;
+
+  const block = formatResultBlock({ task: hit, previewChars: config.bgInjectChars });
+  const combined = `${block}\n\n${baseText}`;
+  if (combined.length > config.maxPromptChars) {
+    // 不消费：结果留在文件里，等用户下一条短一点的
+    log(`后台结果注入后超长（${combined.length} 字），本条不带，留待下次`);
+    return null;
+  }
+  consumeResult(hit.id);
+  log(`本条带上后台任务结果: ${hit.id}`);
+  return combined;
+}
+
+// 布置后台任务时的历史条数。历史是背景，任务是主体。
+function bgHistorySlice(lines) {
+  return lines.slice(-config.bgHistoryLimit);
+}
+
+// 本会话最近一条「疑似后台任务」的自然语言原文（key → 剥离后的任务描述）。
+//
+// 为什么不在这里直接转后台：自然语言触发既要认得出意图，又得知道它是不是
+// 多步骤，而后者只有跑过才知道。所以先照常走模型，执行完再判断——
+// 单步就答完的（「后台是什么」）根本走不到转后台那一步，也就不会误转。
+const pendingBgPrompt = new Map();
+
+// 布置一条后台任务。
+//
+// 顺序是刻意的：先落盘（addTask）→ 再回执 → 最后才 spawn。
+// 反过来的话，进程在「已回执、未落盘」之间被杀，用户还以为任务在跑。
+async function startBgTask({ task, reply }) {
+  const entry = addTask({ conv: task.conv, prompt: task.prompt });
+
+  await reply(
+    `好的，已转到后台执行：「${truncate(task.prompt, 60)}」\n` +
+      `跑完我在这里发结果，这期间你可以继续聊天。（/bg 列表 查看，/bg 取消 1 中止）`,
+  ).catch((e) => log("发送后台任务回执失败: " + e.message));
+
+  const promise = runBgTask(entry);
+  void promise.catch((e) => log(`后台任务 ${entry.id} 未捕获异常: ${e.stack || e.message}`));
+  return entry;
+}
+
+async function handleBgCommand({ event, text, key, role, reply, done }) {
+  if (role !== "admin") {
+    await reply("后台任务是管理员功能。").catch((e) => log("发送权限提示失败: " + e.message));
+    done();
+    return;
+  }
+
+  const cmd = parseBgCommand(text);
+
+  if (!cmd || cmd.action === "help") {
+    await reply(
+      "后台任务：布置后我立刻回执，任务在独立会话里跑，你可以继续聊别的，跑完把结果发回来。\n" +
+        "用法：\n" +
+        "  /bg <要做什么>   布置（也可以直接说「后台帮我查一下…」）\n" +
+        "  /bg 列表         看本会话的任务\n" +
+        "  /bg 取消 <序号>   中止某一条",
+    ).catch((e) => log("发送后台帮助失败: " + e.message));
+    done();
+    return;
+  }
+
+  if (cmd.action === "list") {
+    const mine = loadTasks().filter((t) => t.conv === key);
+    if (!mine.length) {
+      await reply("本会话还没有后台任务。发「/bg <要做什么>」布置一条。").catch((e) =>
+        log("发送后台列表失败: " + e.message),
+      );
+    } else {
+      const now = Date.now();
+      const lines = mine.slice(-10).map((t, i) => {
+        const secs = Math.round((now - (t.startedAt || now)) / 1000);
+        const state =
+          t.status === "running"
+            ? `运行中 ${Math.floor(secs / 60)}分${secs % 60}秒`
+            : t.result?.interrupted
+              ? "被打断"
+              : t.result?.ok
+                ? "已完成"
+                : "失败";
+        return `${i + 1}. [${state}] ${truncate(t.prompt, 40)}`;
+      });
+      await reply(`本会话的后台任务：\n${lines.join("\n")}`).catch((e) =>
+        log("发送后台列表失败: " + e.message),
+      );
+    }
+    done();
+    return;
+  }
+
+  if (cmd.action === "cancel") {
+    const mine = loadTasks()
+      .filter((t) => t.conv === key)
+      .slice(-10);
+    const target = mine[cmd.index - 1];
+    if (!target) {
+      await reply(`没有第 ${cmd.index} 条任务。发「/bg 列表」看看有哪些。`).catch((e) =>
+        log("发送取消失败: " + e.message),
+      );
+      done();
+      return;
+    }
+    if (target.status !== "running") {
+      await reply(`第 ${cmd.index} 条已经结束了，不用取消。`).catch((e) => log("发送取消失败: " + e.message));
+      done();
+      return;
+    }
+
+    const live = bgRunning.get(target.id);
+    if (live) live.controller.abort();
+    updateTask(target.id, {
+      status: "cancelled",
+      result: { ok: false, text: "已被取消。", file: null, at: Date.now(), cost: 0 },
+      delivered: true,
+      injected: true,
+    });
+    await reply(`已中止：「${truncate(target.prompt, 40)}」`).catch((e) => log("发送取消失败: " + e.message));
+    done();
+    return;
+  }
+
+  // action === "run"
+  const prompt = String(cmd.prompt || "").trim();
+  if (prompt.length > config.maxPromptChars) {
+    await reply(`任务描述太长了（${prompt.length} 字），请控制在 ${config.maxPromptChars} 字以内。`).catch(
+      (e) => log("发送超长提示失败: " + e.message),
+    );
+    done();
+    return;
+  }
+
+  const gate = admit({ conv: key, max: config.bgMax });
+  if (!gate.ok) {
+    if (gate.reason === "conv") {
+      const secs = Math.round((Date.now() - (gate.task.startedAt || Date.now())) / 1000);
+      await reply(
+        `这个会话已经有一个后台任务在跑（「${truncate(gate.task.prompt, 30)}」，已 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒）。\n` +
+          `等它跑完，或者发「/bg 取消 1」结束它。`,
+      ).catch((e) => log("发送上限提示失败: " + e.message));
+    } else {
+      await reply(`后台任务已满（${gate.running}/${config.bgMax} 个在跑）。等一个跑完再发。`).catch((e) =>
+        log("发送上限提示失败: " + e.message),
+      );
+    }
+    done();
+    return;
+  }
+
+  done();
+  await startBgTask({ task: { conv: key, prompt }, reply });
+}
+
+
 async function resolveMentionedQq({ name, groupId }) {
   const target = String(name || "").trim();
   if (!target) return undefined;
@@ -1076,6 +1373,16 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     return;
   }
 
+  // /bg：后台任务（仅 admin）。
+  //
+  // 走代码路径而不是模型路径：布置任务是状态变更，且回执必须**立即**发出——
+  // 交给模型意味着先等它跑一轮，那就不是「后台」而是「更慢的前台」了。
+  // 同理，/提醒 那条分支上面也是这个理由。
+  if (BG_PREFIX_RE.test(text)) {
+    await handleBgCommand({ event, text, key, role, reply, done });
+    return;
+  }
+
   // /reset：清空当前会话上下文（仅 admin）。
   //
   // 走代码路径而不是模型路径：共享会话后上下文是全群可见的，重置必须
@@ -1111,7 +1418,9 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   //
   // 不限角色：不泄露任何内容，只是排队信息，谁问都一样。
   if (parseStatusCommand(text)) {
-    const cur = running.get(key);    // 要排除本条自己：这条消息在入队时已落盘（状态 queued），而
+    const cur = running.get(key);
+
+    // 要排除本条自己：这条消息在入队时已落盘（状态 queued），而
     // markRunning 在本函数更靠后的位置才执行——此刻它自己还挂在队列里。
     // 不排除的话，用户只发一条 /status 也会被告知「后面还有 1 条排队」，
     // 那 1 条就是这条命令本身。
@@ -1128,6 +1437,19 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       lines.push("当前没有正在执行的任务。");
     }
     if (depth) lines.push(`后面还有 ${depth} 条排队。`);
+
+    // 后台任务不占用本会话，所以不放在「正在执行」里——混在一起会让人
+    // 以为聊天被堵住了，而它恰恰不堵。
+    const bg = counts(key);
+    if (bg.running.length) {
+      const t = bg.running[0];
+      const secs = Math.round((Date.now() - (t.startedAt || Date.now())) / 1000);
+      lines.push(`后台任务：「${truncate(t.prompt, 30)}」已跑 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒（不占用本会话，可以继续聊天）`);
+    }
+    if (bg.pendingInject.length) {
+      lines.push(`有 ${bg.pendingInject.length} 条后台结果待并入你的下一条消息。`);
+    }
+
     await reply(lines.join("\n")).catch((e) => log("发送状态失败: " + e.message));
     done();
     return;
@@ -1192,10 +1514,45 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     }
   }
 
+  // 判据是 preset?.prompt 而不是 preset：**每次**执行都会带一个 preset
+  // （startExec 传 { prompt, sessionId, exec }），只是普通消息的 prompt 为
+  // undefined——用 !!preset 判断会永远为真，历史一次都加不上。
+  // 本函数下面几处（后台结果注入、自然语言登记、群聊历史）都要用它。
+  const mergedPrompt = preset?.prompt;
+
+  // 后台任务的结果并入本条消息。
+  //
+  // 为什么必须注入而不只是推送：只把结果发到聊天窗口的话，用户接着问
+  // 「那个结果里第二项是什么」，模型对这条结果一无所知——而这正是本功能的重点。
+  //
+  // 判据用 preset?.prompt（即 mergedPrompt）而不是 !preset：**每次**执行都会
+  // 带一个 preset 对象（startExec 传 { prompt, sessionId, exec }），!preset
+  // 永远为假。只有合并重跑才该跳过——那条的 prompt 已经是定稿。
+  //
+  // 顺序是「后台结果 → 文件信息 → 用户这句话」：背景在前、请求在后。
+  // 长度检查在 takeBgResult 内部（未通过则不消费），与文件缓存同理。
+  if (!mergedPrompt && config.bgResultInject) {
+    const merged = takeBgResult(key, effectiveText);
+    if (merged) effectiveText = merged;
+  }
+
   if (text.length > config.maxPromptChars) {
     await reply(`消息太长了（${text.length} 字），请控制在 ${config.maxPromptChars} 字以内。`);
     done();
     return;
+  }
+
+  // 带后台任务的钩子：先登记，等这轮跑完再看是不是该转后台。
+  //
+  // 只登记不拦截——单步就能答完的（「后台是什么意思」）会照常回复，
+  // 只有模型确实干起了活（调了工具）才走转后台那条路。
+  //
+  // 用原始 text 而不是 effectiveText：历史与文件信息是给模型的背景，
+  // 不该进入任务描述。判据同上：每次都有 preset，只有合并重跑要跳过。
+  if (!mergedPrompt && config.bgNaturalTrigger && role === "admin") {
+    const nat = parseNaturalTrigger(text);
+    if (nat) pendingBgPrompt.set(key, nat.prompt);
+    else pendingBgPrompt.delete(key);
   }
 
   // 共享会话里模型只能靠前缀知道是谁在说话。只在群聊加——私聊会话只有一个人。
@@ -1210,15 +1567,9 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   //
   // 只在群聊、且不是合并重跑时加：preset.prompt 已经是合并好的定稿，
   // 再拼一次会让两条消息各带一份历史。
-  // 只在群聊、且不是合并重跑时加。
-  //
-  // 判据是 preset?.prompt 而不是 preset：**每次**执行都会带一个 preset
-  // （startExec 传 { prompt, sessionId, exec }），只是普通消息的 prompt 为
-  // undefined——用 !!preset 判断会永远为真，历史一次都加不上。
-  const mergedPrompt = preset?.prompt;
   let prompt = userLine;
   if (isGroup && config.historyContext && !mergedPrompt) {
-    const lines = await recentHistory(groupId);
+    const lines = await recentHistory(groupId, { isGroup: true });
     const body = historyBody(lines);
     if (body) {
       prompt = `${body}\n\n${userLine}`;
@@ -1261,10 +1612,15 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   // baseline 对象是引用共享的：enqueue 建 exec 时就放进去，这里回填值，
   // 判据那边读到的就是最新值。
   const baseline = preset?.exec?.baseline ?? { lines: null };
+  const steps = { from: null };
   const wireBaseline = (sessionId) => {
     if (!sessionId) return;
     const p = sessPath(sessionId);
     const atSpawn = sessionLineCount(p);
+    // 单独记一份"本条开始时的行号"给 countSteps 当游标。
+    // 不能借用 baseline.lines：那个字段的语义是"有没有动过工具"，
+    // 没变化时**必须**保持 null（合并打断的判据依赖这一点）。
+    steps.from = atSpawn;
     const poll = setInterval(() => {
       const now = sessionLineCount(p);
       if (now === null || now === atSpawn) return;
@@ -1273,6 +1629,26 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     }, 150);
     poll.unref?.();
     setTimeout(() => clearInterval(poll), 2000).unref?.();
+  };
+
+  // 本次跑下来到底调了几次工具。自然语言转后台的判据（见下方「转后台」段）：
+  // 一步都没走才敢转——走过就意味着模型已经亲自动手，转后台等于把干了一半
+  // 的活丢给另一个会话重做。
+  //
+  // 从本条开始时的行号往后读：全量读会把历史轮次的调用也算进来，
+  // 那样只要聊过天就永远"调过工具"，自然语言触发一次都不会成立。
+  const countSteps = (sessionId) => {
+    if (!sessionId || steps.from === null) return 0;
+    try {
+      const delta = readSessionDelta(sessPath(sessionId), steps.from, { limit: 1 });
+      if (!delta) return 0;
+      // 用 dangling 而不是 calls.length：calls 受 limit 截断，而 dangling
+      // 是从全量算的。一步没走时两者都是 0；走过一步时 dangling 至少为 1
+      // （那次调用的 tool_result 还没落盘，或者刚落盘但都在本区间内）。
+      return delta.calls.length + delta.dangling.length;
+    } catch {
+      return 0; // 读不到就按"没调过"处理，最坏是转后台，比卡住好
+    }
   };
 
 
@@ -1418,6 +1794,41 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   if (result.sessionId) {
     sessions.set(key, result.sessionId);
     saveSessions();
+  }
+
+  // 自然语言触发的后台任务：模型干到一半发现这活儿该转后台。
+  //
+  // 为什么在**执行后**才判断，而不是收到消息就拦：
+  //   「后台帮我查一下 D 盘」这条既要认得出是后台任务，又得知道它是不是
+  //   多步骤。前者靠正则，后者只有跑过才知道——单步就答完的（例如问一句
+  //   「后台是什么」）根本没机会走到这里，也就不会被误转。
+  //
+  // 为什么要求「一步都没走」：模型一旦调过工具，就说明它已经亲自动手了，
+  // 此时再转后台等于把干了一半的活丢给另一个会话重做。宁可不转。
+  //
+  // 认出来就丢弃本轮回复（它多半是「好的，我这就去查」这类空话），
+  // 改由后台任务真正去做、跑完再回来。
+  if (!mergedPrompt && config.bgNaturalTrigger && role === "admin" && result.sessionId) {
+    const pending = pendingBgPrompt.get(key);
+    if (pending && countSteps(result.sessionId) === 0) {
+      pendingBgPrompt.delete(key);
+      log(`本条识别为后台任务（自然语言），转入后台: ${truncate(pending, 40)}`);
+      done();
+      running.delete(key);
+      await settle();
+      const gate = admit({ conv: key, max: config.bgMax });
+      if (!gate.ok) {
+        await reply(
+          gate.reason === "conv"
+            ? `这条看起来该转后台，但这个会话已经有一个后台任务在跑了（「${truncate(gate.task.prompt, 30)}」）。等它跑完再发一次。`
+            : `这条看起来该转后台，但后台任务已满（${gate.running}/${config.bgMax} 个在跑）。等一个跑完再发。`,
+        ).catch((e) => log("发送上限提示失败: " + e.message));
+        return;
+      }
+      await startBgTask({ task: { conv: key, prompt: pending }, reply });
+      return;
+    }
+    pendingBgPrompt.delete(key);
   }
 
   // 处理完成，从磁盘队列摘除。放在发送**之前**是有意的：
@@ -1591,6 +2002,9 @@ function isDirectCommand(text) {
   if (!t) return false;
   if (parseDiagnosticCommand(t) || parseStatusCommand(t) || parseResetCommand(t)) return true;
   if (/^\/提醒/.test(t)) return true;
+  // /bg 必须在这里认出来：认不出来的话，任务运行中发 /bg 会被合并打断吞掉、
+  // 或者排到那条任务自己后面——恰恰在最需要它的时候失效。
+  if (BG_PREFIX_RE.test(t)) return true;
   return resolveRoleTarget({ text: t, mentionAts: [], selfId: config.selfId }) !== null;
 }
 
@@ -1685,7 +2099,7 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
       void interruptForMerge(key, event).then((ok) => {
         if (!ok) {
           log(`合并打断失败，改为排队: ${key}`);
-          startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
+          startExec(key, event, entryId, null, sessions.get(key) || null);
         }
       });
       return;
@@ -1707,13 +2121,13 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
       // 条目不在队列里就说明不必再跑，否则会重复执行。
       const still = loadEntries().some((e) => e.id === entryId);
       if (entryId && !still) return;
-      startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
+      startExec(key, event, entryId, null, sessions.get(key) || null);
     }, 200);
     poll.unref?.();
     return;
   }
 
-  startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
+  startExec(key, event, entryId, null, sessions.get(key) || null);
 }
 
 client = new OneBotWsClient({
@@ -1890,6 +2304,30 @@ async function restoreQueue() {
 client.connect();
 restoreQueue().catch((error) => log(`队列恢复失败: ${error.message}`));
 
+// 后台任务：把「跑着跑着进程没了」的那些收尾。
+//
+// 与消息队列不同，**不自动重放**：重跑一条 /bg 只是重打一行字，
+// 而队列那套基线恢复是为了判断「到底执行过没有」——后台任务的 prompt
+// 是用户新写的指令，重跑可能把破坏性操作又做一遍，交给用户决定更安全。
+async function sweepBg() {
+  const swept = sweepInterrupted();
+  for (const task of swept) {
+    log(`后台任务 ${task.id} 被重启打断，已标记`);
+    const isGroup = String(task.conv).startsWith("group:");
+    const id = Number(String(task.conv).split(":")[1]);
+    const notice = `刚才那条后台任务（「${truncate(task.prompt, 40)}」）被重启打断了，需要的话再发一次。`;
+    try {
+      await sendWhenConnected(
+        isGroup ? "send_group_msg" : "send_private_msg",
+        isGroup ? { group_id: id, message: notice } : { user_id: id, message: notice },
+      );
+    } catch (error) {
+      log(`通知后台任务被打断失败: ${error.message}`);
+    }
+  }
+}
+sweepBg().catch((error) => log(`后台任务恢复失败: ${error.message}`));
+
 // 定时推送。放在 connect 之后：调度器发送时要经 client，虽然它自带
 // 未连接重试，但启动即触发的那次检查等连上更稳妥。
 startScheduler({ client, config, log });
@@ -1901,3 +2339,4 @@ function shutdown(signal) {
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+

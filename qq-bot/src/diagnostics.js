@@ -239,8 +239,26 @@ function sectionFiles(files) {
     );
   }
   if (files?.pendingRetry) rows.push(`  待重放条目 ${files.pendingRetry} 条（等用户回「继续」）`);
+  if (files?.bgPending) rows.push(`  待注入的后台结果 ${files.bgPending} 条`);
   if (files?.workspace) rows.push(`  工作目录 workspace：${files.workspace}`);
   return rows;
+}
+
+// 后台任务。与【执行】分开：后台任务**不占用会话**，混在一起会让人
+// 以为聊天被堵住了，而它恰恰不堵。
+function sectionBackground(tasks, now) {
+  if (!tasks?.length) return null;
+  const rows = [];
+  for (const t of tasks) {
+    const conv = String(t.conv || "").replace("private:", "私聊").replace("group:", "群");
+    if (t.status === "running") {
+      const secs = Math.round((now - (t.startedAt || now)) / 1000);
+      rows.push(`  ${conv} ${fmtDur(secs * 1000)}｜${truncate(t.prompt, 30)}`);
+    } else if (t.status === "done" && !t.injected) {
+      rows.push(`  ${conv} 已完成待注入｜${truncate(t.prompt, 30)}`);
+    }
+  }
+  return rows.length ? rows : null;
 }
 
 // 各节按显示顺序排列。cuttable 的节在报告超长时会被整节砍掉。
@@ -252,6 +270,7 @@ const SECTIONS = [
   ["依赖", (s) => sectionDeps(s.deps), false],
   ["任务", (s, now) => sectionProcesses(s.processes ?? [], now), true],
   ["执行", (s, now) => sectionExec(s.execs ?? [], now, s.mergeWindowMs), true],
+  ["后台", (s, now) => sectionBackground(s.background ?? [], now), true],
   ["压缩", (s, now) => sectionCompacting(s.compacting ?? [], now), true],
   ["队列", (s, now) => sectionQueue(s.queueEntries ?? [], now, s.mergeWindowMs), true],
   ["会话", (s) => sectionSessions(s.sessionMeta ?? [], s.sessions?.compactMb, s.sessions?.maxMb), true],
@@ -264,7 +283,10 @@ const SECTIONS = [
 // 【最近】排第一不只是因为它最长（每个会话两行），也因为它最可能误导：
 // 会话文件里的记录时间是"用户说的那一刻"，跨重启仍然显示，
 // 而用户真正想知道的是"现在为什么没回复"。
-const CUT_ORDER = ["最近", "会话", "队列", "文件", "压缩", "任务", "执行"];
+//
+// 【后台】排在【压缩】之前砍：它回答的是"这个进程现在在干什么"，
+// 而诊断存在的意义正在于此，所以该晚点砍。
+const CUT_ORDER = ["最近", "会话", "队列", "文件", "压缩", "后台", "任务", "执行"];
 
 function compose(rows, startedAt, total) {
   const lines = [`诊断（${fmtClock(startedAt)}）`];

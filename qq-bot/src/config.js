@@ -282,6 +282,45 @@ export function loadConfig() {
     // 优先 QQ_WORKSPACE_DIR，其次 ${QQ_DATA_DIR}\workspace。
     workspaceDir: path(env.QQ_WORKSPACE_DIR, "workspace"),
 
+    // ---- 后台任务 ----
+
+    // 后台任务的落盘位置。刻意**不**复用 queue.json：那份文件的启动恢复
+    // 会从事件重算 convKey，把后台任务重放进主会话，正是要避免的污染。
+    bgTasksPath: path(env.QQBOT_BG_TASKS, "bg-tasks.json"),
+
+    // 超时。不用 timeoutMs（5 分钟）——那个限制的成立理由是「有人在等」，
+    // 用户就坐在 QQ 前面。后台任务没人等，该给更长的绳。
+    bgTimeoutMs: Number(env.QQ_BG_TIMEOUT_MS) || 1800000,
+
+    // 全局并发上限。每个任务是一个完整 claude.exe + 独立 MCP 会话，
+    // 而机器同时还在服务实时聊天、共用同一个 cc-switch 代理。
+    bgMax: Number(env.QQ_BG_MAX) || 3,
+
+    // 结果的过期时间。比文件缓存的 5 分钟长得多——那是给「刚发的那条消息」
+    // 消解代词用的；这是用户明确布置、当天很可能会回来追问的任务。
+    bgResultTtlMs: Number(env.QQ_BG_RESULT_TTL_MS) || 86400000,
+
+    // 结果注入主会话时的预览上限。必须封顶：全文可能几万字，整段塞进
+    // prompt 会顶破 maxPromptChars，而那个检查在组装之后——一旦超长，
+    // 该会话之后每条消息都会被拒，用户就彻底说不了话了。
+    bgInjectChars: Number(env.QQ_BG_INJECT_CHARS) || 1200,
+
+    // 后台任务 prompt 里附带最近几条会话消息的条数。
+    // 任务跑在全新会话里，对「刚才聊的那些」零上下文，补上能显著提升完成质量，
+    // 也补掉了自然语言触发丢掉回指能力后的缺口。
+    // 比群聊回溯的 20 条小——那是消解代词，这是补背景。
+    bgHistoryLimit: Number(env.QQ_BG_HISTORY_LIMIT) || 10,
+
+    // 是否支持自然语言触发（「后台帮我查一下…」），默认开。
+    // 关掉就只认 /bg 指令。误判代价极低（多跑一个无害任务），
+    // 而要求用户记住指令是实打实的使用负担，所以默认开。
+    bgNaturalTrigger: env.QQ_BG_NATURAL !== "false",
+
+    // 是否把已完成的结果并入主会话上下文，默认开。
+    // 关掉会退化成「只推送不注入」——用户在聊天窗口看得到结果，
+    // 但接着追问细节时模型一无所知。
+    bgResultInject: env.QQ_BG_INJECT !== "false",
+
     // claude 的会话记录目录（--resume 读的就是这里）。
     // 这个目录由 CLI 管理、位置固定，默认跟随 claudeHome。
     projectsBase: env.QQ_PROJECTS_BASE || `${env.QQ_CLAUDE_HOME || "C:\\Users\\Administrator"}\\.claude\\projects`,

@@ -19,12 +19,13 @@ function base(over = {}) {
     mergeWindowMs: 5000,
     processes: [],
     execs: [],
+    background: [],
     queueEntries: [],
     queueTotal: 0,
     sessionMeta: [],
     activity: [],
     deps: { proxy: { ok: true }, claudeExe: "C:\\claude.exe" },
-    files: { queueFile: { sizeMb: 0.01 }, jobsFile: { count: 2 }, pendingFiles: 0, pendingRetry: 0 },
+    files: { queueFile: { sizeMb: 0.01 }, jobsFile: { count: 2 }, pendingFiles: 0, pendingRetry: 0, bgPending: 0 },
     sessions: { compactMb: 1.5, maxMb: 3 },
     ...over,
   };
@@ -71,6 +72,7 @@ test("空快照：该显示的一节不落，不该出现的节不冒出来", ()
   // 无事可报的节连标题都不显示
   assert.ok(!text.includes("【任务】"), "没有子进程时不该出现【任务】");
   assert.ok(!text.includes("【执行】"), "没有执行中任务时不该出现【执行】");
+  assert.ok(!text.includes("【后台】"), "没有后台任务时不该出现【后台】");
   assert.ok(!text.includes("【会话】"), "没有会话时不该出现【会话】");
   assert.ok(!text.includes("【最近】"), "没有活动记录时不该出现【最近】");
 });
@@ -115,13 +117,38 @@ test("执行中：超过合并窗口要说明不会再被打断", () => {
   assert.ok(!text.includes("帮我装个软件"), "【执行】不该重复【任务】已经给出的话题");
 });
 
+test("后台任务：单独一节，显示会话、时长与任务内容", () => {
+  const text = buildDiagnostic(
+    base({
+      background: [
+        { id: "t1", conv: "private:123", prompt: "查一下 D 盘哪个目录最占空间", startedAt: NOW - 3 * MIN, status: "running" },
+        { id: "t2", conv: "group:456", prompt: "整理待办", startedAt: NOW - 10 * MIN, status: "done", result: { ok: true, text: "x" } },
+      ],
+    }),
+  );
+  assert.match(text, /【后台】/);
+  assert.match(text, /私聊123 3分｜查一下 D 盘/);
+  assert.match(text, /群456 已完成待注入/);
+});
+
+test("后台任务：不混进【执行】——它不占用会话", () => {
+  // 混进【执行】会让人以为聊天被堵住了，而它恰恰不堵。
+  // 没有 execs 时【执行】整节都不该出现。
+  const text = buildDiagnostic(
+    base({
+      background: [{ id: "t1", conv: "private:1", prompt: "跑着的", startedAt: NOW - 1000, status: "running" }],
+    }),
+  );
+  assert.ok(!text.includes("【执行】"), "后台任务不该让【执行】冒出来");
+  assert.match(text, /【后台】/);
+});
+
 test("执行中：窗口内不该出现「超出合并窗口」的提示", () => {
   const text = buildDiagnostic(
     base({
       execs: [{ key: "private:1", what: "x", startedAt: NOW - 1000, sessionId: null, memberCount: null }],
     }),
-  );
-  assert.ok(!text.includes("已超出合并窗口"));
+  );  assert.ok(!text.includes("已超出合并窗口"));
   assert.match(text, /会话 未建立/);
 });
 

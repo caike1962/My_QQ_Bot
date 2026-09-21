@@ -30,6 +30,7 @@ test("不设 QQ_DATA_DIR 时全部落到内置默认目录", () => {
     assert.equal(c.sessionsPath, "D:\\QQBOT\\qq-bot\\sessions.json");
     assert.equal(c.queuePath, "D:\\QQBOT\\qq-bot\\queue.json");
     assert.equal(c.rolesPath, "D:\\QQBOT\\qq-bot\\roles.json");
+    assert.equal(c.bgTasksPath, "D:\\QQBOT\\qq-bot\\bg-tasks.json");
     assert.equal(c.jobsPath, "D:\\QQBOT\\qq-bot\\jobs.json");
     assert.equal(c.workspaceDir, "D:\\QQBOT\\qq-bot\\workspace");
     assert.equal(c.claudeMcpConfig, "D:\\QQBOT\\qq-bot\\mcp-config.json");
@@ -42,6 +43,7 @@ test("设了 QQ_DATA_DIR 后，状态文件全部跟着走", () => {
     assert.equal(c.sessionsPath, "E:\\NewBot\\sessions.json");
     assert.equal(c.queuePath, "E:\\NewBot\\queue.json");
     assert.equal(c.rolesPath, "E:\\NewBot\\roles.json");
+    assert.equal(c.bgTasksPath, "E:\\NewBot\\bg-tasks.json");
     assert.equal(c.jobsPath, "E:\\NewBot\\jobs.json");
     assert.equal(c.workspaceDir, "E:\\NewBot\\workspace");
   });
@@ -72,6 +74,7 @@ test("转移部署只需改 QQ_DATA_DIR 一行（这是本功能的核心承诺�
       ["sessionsPath", c.sessionsPath],
       ["queuePath", c.queuePath],
       ["rolesPath", c.rolesPath],
+      ["bgTasksPath", c.bgTasksPath],
       ["jobsPath", c.jobsPath],
       ["workspaceDir", c.workspaceDir],
     ]) {
