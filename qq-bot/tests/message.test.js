@@ -15,6 +15,7 @@ import {
   withSenderPrefix,
   parseResetCommand,
   parseStatusCommand,
+  parseDiagnosticCommand,
 } from "../src/message.js";
 
 // ---------- extractText ----------
@@ -613,6 +614,27 @@ test("parseStatusCommand: 两种写法都识别，容忍空白", () => {
 test("parseStatusCommand: 带参数/普通文本不识别，且不会吃掉 /reset", () => {
   for (const bad of ["/status now", "status", "/状态如何", "", null, undefined, "/reset"]) {
     assert.equal(parseStatusCommand(bad), false, `"${bad}" 不应识别`);
+  }
+});
+
+test("parseDiagnosticCommand: 只认精确的 /诊断", () => {
+  for (const s of ["/诊断", " /诊断 ", "\t/诊断\n"]) {
+    assert.equal(parseDiagnosticCommand(s), true, `"${s}" 应识别`);
+  }
+});
+
+test("parseDiagnosticCommand: 带后缀不识别（那是别的事，交给模型）", () => {
+  for (const bad of [
+    "/诊断 一下",
+    "诊断",
+    "/诊断群",
+    "",
+    null,
+    undefined,
+    "/status",
+    "/提醒",
+  ]) {
+    assert.equal(parseDiagnosticCommand(bad), false, `"${bad}" 不应识别`);
   }
 });
 

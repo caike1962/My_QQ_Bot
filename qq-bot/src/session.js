@@ -24,8 +24,19 @@ export function sessionLineCount(filePath) {
   }
 }
 
-export function sessionPath(projectDir, sessionId) {
-  return `C:\\Users\\Administrator\\.claude\\projects\\${projectDir}\\${sessionId}.jsonl`;
+// 会话文件所在的目录。项目名是把 cwd 的非字母数字字符换成 "-"（见 index.js），
+// 所以它和项目目录名都由调用方传入，这里不重复推导规则。
+//
+// baseDir 默认是当前机器上的用户目录（也是 claudeHome 的默认值），
+// 允许注入是为了让诊断/测试不必依赖写死的路径。
+export const DEFAULT_PROJECTS_BASE = "C:\\Users\\Administrator\\.claude\\projects";
+
+export function projectDirPath(projectDir, baseDir = DEFAULT_PROJECTS_BASE) {
+  return `${baseDir}\\${projectDir}`;
+}
+
+export function sessionPath(projectDir, sessionId, baseDir = DEFAULT_PROJECTS_BASE) {
+  return `${baseDir}\\${projectDir}\\${sessionId}.jsonl`;
 }
 
 // 截断字符串用于日志，但不切碎 emoji。

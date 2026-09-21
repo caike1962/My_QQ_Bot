@@ -1,14 +1,15 @@
-import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSync, closeSync, openSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
-import { runClaude, compactSession, ClaudeError } from "./claude.js";
-import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
+import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
+import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, senderLabel } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
+import { buildDiagnostic } from "./diagnostics.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -160,6 +161,338 @@ function humanSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+// ———— /诊断 的数据采集 ————
+//
+// 要回答的问题（「为什么没回复」「是不是卡住了」「队列里有没有残留」）
+// 全都依赖只在内存里活着的东西：进程年龄、队列条目时间、最后一条消息何时到。
+// 所以采集点散布在各条主路径上。真正的结论来自磁盘上的会话记录——
+// 内存态只能证明"进程在跑"，证明不了"它跑到哪了"。
+
+const BOOT_AT = Date.now();
+const QUEUE_PATH = process.env.QQBOT_QUEUE || "D:\\QQBOT\\qq-bot\\queue.json";
+
+// 本会话最后一次收到消息的时刻。容量上限防止群多时无限增长。
+const recent = new Map();
+const RECENT_MAX = 10;
+
+// 自启动以来处理完的正常消息条数。命令类消息不计入——这个数的用途是
+// 判断"消息整体在流动吗"，把命令混进去只会冲淡信号。
+let doneSinceBoot = 0;
+let lastRecvAt = null;
+
+// 正在后台压缩的会话：key → { sessionId, startedAt }。
+//
+// 为什么要单独记：压缩是几分钟的后台任务，期间该会话的下一条消息会明显变慢。
+// 没有这份记录的话，那几分钟里的诊断只会显示一个空白的【执行】节，
+// 而用户问的恰恰是"怎么这么慢"。
+const compacting = new Map();
+
+// 正在生成的诊断。诊断要花几百毫秒（查群成员 + 读会话文件 + 探代理），
+// 这个窗口内用户再发一条就会各生成一份——实测同一秒内发两次诊断，
+// 群里会收到两条几乎一样的报告，看起来像机器人失控。
+let diagnosing = false;
+
+function noteRecv(key, text) {
+  lastRecvAt = Date.now();
+  recent.set(key, { key, text, at: lastRecvAt });
+  if (recent.size > RECENT_MAX) recent.delete(recent.keys().next().value);
+}
+
+// 每次 /诊断 要查一遍群人数（「是不是别人把队列占住了」的第一反应），
+// 但说话多的人会连着问好几次，所以按 60s 缓存。
+const groupSizeCache = new Map();
+const GROUP_SIZE_TTL_MS = 60_000;
+
+// 会话文件尾部存着最近的真实活动。只读末尾 64 KB：诊断是即时命令，
+// 而会话文件可能几 MB，不值得整个读一遍。读到的第一行可能是被切开的
+// 半截 JSON，parse 失败会被跳过——这正是能接受的，尾部记录才是我们要的。
+//
+// 顺带把 statSync 拿到的体积返回出去：调用方要显示会话大小，
+// 再单独 statSync 一次就是白扔的 syscall（实测每会话能省一次 open+stat）。
+function readTailRecords(path, bytes = 65536, max = 40) {
+  let fd;
+  try {
+    const size = statSync(path).size;
+    if (!size) return null;
+    const start = Math.max(0, size - bytes);
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(size - start);
+    readSync(fd, buf, 0, buf.length, start);
+    const out = [];
+    for (const line of buf.toString("utf8").split("\n")) {
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+        /* 被切开的半截行 */
+      }
+    }
+    const records = out.filter((r) => r && typeof r === "object").slice(-max);
+    // sizeMb 挂在数组上而不是包一层对象：调用方大半只关心记录本身，
+    // 多一层解构会让每个使用点都变啰嗦。
+    records.sizeMb = size / 1048576;
+    return records;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* 关不上也不该让诊断失败 */
+      }
+    }
+  }
+}
+
+// 从会话记录里挑出最后一次真实对话。
+//
+// 过滤规则都是实测踩出来的：tool_result 也以 type:"user" 落盘、本地命令
+// 落盘时整段包在 <command-name> 里、系统注入的提示以 < 开头。
+// 把这些当"用户最后说的话"会让诊断指向错误的方向。
+//
+// 顺带从同一批记录里带出模型名：CLI 每一轮 assistant 都会重写 message.model，
+// 所以它几乎总在尾部窗口内。这样就不必再调 sessionModel 把整个文件读一遍
+// （实测 2 MB 会话全读要 7ms，而这里等于 0）。
+function lastExchange(records) {
+  if (!records?.length) return null;
+
+  const textOf = (rec) => {
+    const content = rec?.message?.content;
+    if (typeof content === "string") return content.trim();
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter((b) => b?.type === "text")
+      .map((b) => b.text || "")
+      .join(" ")
+      .trim();
+  };
+
+  let said = null;
+  for (const rec of records) {
+    if (rec?.type !== "user" || rec.isMeta || rec.toolUseResult !== undefined) continue;
+    const text = textOf(rec);
+    if (!text || text.startsWith("<")) continue;
+    said = { text, at: Date.parse(rec.timestamp) };
+  }
+
+  let replied = null;
+  let model = null;
+  for (let i = records.length - 1; i >= 0; i--) {
+    const rec = records[i];
+    // 模型名和"最后一句回复"分开找：回复可能来自更早的那条 assistant，
+    // 而模型名取最新的那条即可。
+    if (!model && typeof rec?.message?.model === "string" && rec.message.model) {
+      model = rec.message.model;
+    }
+    if (rec?.type !== "assistant") continue;
+    if (!replied) {
+      const text = textOf(rec);
+      if (text) replied = { text, at: Date.parse(rec.timestamp) };
+    }
+    if (replied && model) break;
+  }
+
+  return said || replied || model ? { said, replied, model } : null;
+}
+
+function workspaceStatus() {
+  const p = config.claudeCwd ? `${config.claudeCwd}\\workspace` : null;
+  if (!p) return null;
+  const fallback = "D:\\QQBOT\\qq-bot\\workspace";
+  const dir = existsSync(p) ? p : fallback;
+  if (!existsSync(dir)) return "不存在";
+  try {
+    const names = readdirSync(dir);
+    return names.length ? `${names.length} 个文件` : "空";
+  } catch {
+    return "读取失败";
+  }
+}
+
+// 子进程列表，直接就是渲染层要的形状。已跑完的记录只在「刚跑完」时才有
+// 参考价值——正常时刻这一节本该是空的，跑完即摘除的进程出现在诊断里
+// 只会制造噪音（"它跑过"这件事，会话文件里的记录说得更清楚）。
+//
+// liveProcs() 返回的已经是浅拷贝，不必再手工重列一遍字段。
+function liveProcessSnapshot(now) {
+  return liveProcs().filter((p) => !p.done || now - p.startedAt < 60_000);
+}
+
+async function groupMemberCount(groupId) {
+  const cached = groupSizeCache.get(groupId);
+  if (cached && Date.now() - cached.at < GROUP_SIZE_TTL_MS) return cached.n;
+  try {
+    const res = await client.action("get_group_member_list", { group_id: groupId });
+    const n = Array.isArray(res?.data) ? res.data.length : null;
+    groupSizeCache.set(groupId, { n, at: Date.now() });
+    return n;
+  } catch (error) {
+    log(`诊断：查群 ${groupId} 成员数失败: ${error.message}`);
+    return null;
+  }
+}
+
+function fileSizeMb(path) {
+  try {
+    return statSync(path).size / 1048576;
+  } catch {
+    return null;
+  }
+}
+
+// 渲染用的时间轴：会话文件里的记录时间戳是 ISO 字符串，比内存里记的
+// "收到时刻"更权威（重启后内存就没了，磁盘上的还在）。
+// 解析失败的记录（时间是空的）直接跳过——宁可不显示，也不显示一个 1970 年。
+function atTime(t) {
+  const n = Date.parse(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function collectDiagnostic(mergeWindowMs) {
+  const now = Date.now();
+
+  // 代理探测**先发出去**、最后再 await：它带 2s 超时，而下面全是同步的文件 IO。
+  // 顺序执行的话这 2s 是纯叠加；并发出去之后它就躲在文件读取后面，代价归零。
+  // cc-switch 不在 = 所有消息必失败，值得一次真实连接来确认。
+  const proxyProbe = fetch(config.claudeBaseUrl, { signal: AbortSignal.timeout(2000) })
+    .then((res) => ({ ok: true, status: res.status }))
+    .catch((error) => ({ ok: false, error: error.message }));
+
+  // 群人数：批量查一次，供会话标签与活动行共用。
+  // 并发发出——串行 await 会让每个群各等一个 WS 往返，群一多诊断就明显变慢。
+  // 按「群号 → 人数」存，最后再映射到各会话键上。
+  const groupIds = new Set();
+  for (const k of new Set([...sessions.keys(), ...recent.keys()])) {
+    const m = /^group:(\d+)$/.exec(k);
+    if (m) groupIds.add(Number(m[1]));
+  }
+  const counts = new Map();
+  await Promise.all(
+    [...groupIds].map(async (id) => counts.set(id, await groupMemberCount(id))),
+  );
+  // 关掉群共享会话时键是「群号:QQ号」，两种形态都要认
+  const memberCountFor = (k) => {
+    const m = /^(?:group:(\d+)|(\d+):\d+)$/.exec(k);
+    return m ? (counts.get(Number(m[1] ?? m[2])) ?? null) : null;
+  };
+
+  // 每个会话只读一遍尾部：这份文件可能几 MB，而它同时要供
+  // 【会话】节（体积/模型）和【最近】节（最后一次对话）使用。
+  // 体积和模型名都从这一次读里带出来，不再单独 statSync / 全文件扫。
+  const sessionMeta = [];
+  const activity = [];
+  for (const [k, sid] of sessions) {
+    const path = sessionPath(PROJECT_DIR, sid);
+    const tail = readTailRecords(path);
+    const last = lastExchange(tail);
+    const mem = recent.get(k);
+    const memberCount = memberCountFor(k);
+
+    sessionMeta.push({
+      key: k,
+      sessionId: sid,
+      // null 表示文件不存在或读不到——渲染层会区分这两种说法
+      sizeMb: tail ? tail.sizeMb : null,
+      model: last?.model ?? null,
+      memberCount,
+    });
+
+    activity.push({
+      key: k,
+      memberCount,
+      // 磁盘上的记录优先；内存态只补"刚收到、还没来得及落盘"的那条
+      lastRecv: atTime(last?.said?.at) ?? mem?.at ?? null,
+      lastText: last?.said?.text
+        ? truncate(last.said.text, 40)
+        : mem?.text
+          ? truncate(mem.text, 40)
+          : null,
+      lastReply: atTime(last?.replied?.at),
+    });
+  }
+
+  const entries = loadEntries();
+  const nowTs = Date.now();
+  const staleFiles = [...pendingFiles.entries()].filter(
+    ([, v]) => nowTs - v.at > PENDING_FILE_TTL_MS,
+  ).length;
+
+  // 执行中的会话。注意别叫 execs：外面那个同名 Map 正是这里要读的来源，
+  // 同名 const 会在初始化前引用它自己（TDZ 报错）。
+  const execList = [...execs.entries()].map(([k, e]) => {
+    const sid = e.sessionId || sessions.get(k) || null;
+    const path = sid ? sessionPath(PROJECT_DIR, sid) : null;
+    // 执行者的事件里没有原文时才回退到会话文件——而文件正被这个进程写着，
+    // 读到的可能是半行，所以只取小窗口且失败就当没有。
+    const last = !e.prompt && path ? lastExchange(readTailRecords(path, 16384, 20)) : null;
+    const what = e.prompt
+      ? truncate(String(e.prompt).replace(/\s+/g, " "), 50)
+      : last?.said?.text
+        ? truncate(last.said.text, 50)
+        : "(内容未知)";
+    return {
+      key: k,
+      what,
+      startedAt: e.startedAt,
+      sessionId: sid,
+      memberCount: memberCountFor(k),
+    };
+  });
+
+  let jobsFile = null;
+  try {
+    if (existsSync(config.jobsPath)) {
+      jobsFile = { count: loadJobs(config.jobsPath).length };
+    }
+  } catch {
+    jobsFile = { count: 0 };
+  }
+
+  // 代理探测早在本函数开头就发出去了，到这里才收——中间的文件 IO
+  // 已经把它那点延迟盖掉了。
+  const proxy = await proxyProbe;
+
+  return {
+    now,
+    pid: process.pid,
+    ws: !client?.ws ? "未建立" : client.ws.readyState === 1 ? "已连接" : "未连接（重连中）",
+    startedAt: BOOT_AT,
+    lastRecvAt,
+    queuedSinceBoot: doneSinceBoot,
+    bootRecent: now - BOOT_AT < 180_000,
+    mergeWindowMs,
+    processes: liveProcessSnapshot(now),
+    execs: execList,
+    queueEntries: entries.slice(0, 30),
+    queueTotal: entries.length,
+    // 压缩中的会话单列一节：它解释"为什么这条会话的下一条会慢"
+    compacting: [...compacting.entries()].map(([k, v]) => ({
+      key: k,
+      sessionId: v.sessionId,
+      startedAt: v.startedAt,
+      memberCount: memberCountFor(k),
+    })),
+    sessionMeta,
+    activity,
+    deps: {
+      proxy,
+      claudeExe: existsSync(config.claudeExe) ? config.claudeExe : null,
+    },
+    files: {
+      queueFile: existsSync(QUEUE_PATH) ? { sizeMb: fileSizeMb(QUEUE_PATH) } : null,
+      jobsFile,
+      pendingFiles: pendingFiles.size,
+      staleFiles,
+      pendingRetry: pendingRetry.size,
+      workspace: workspaceStatus(),
+    },
+    sessions: {
+      compactMb: config.sessionCompactMb,
+      maxMb: config.sessionMaxMb,
+    },
+  };
 }
 
 // 把文件信息编进 prompt。必须给全 file_id —— 模型靠它调
@@ -364,6 +697,9 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   const files = extractFiles(event.message);
   if (files.length) {
     const total = files.reduce((s, f) => s + (f.size || 0), 0);
+    // 通知文件消息也记进诊断活动：QQ 把文件和文字拆成两条，用户很可能
+    // 紧接着就发文字，而"最后收到的是什么"正是诊断要回答的。
+    noteRecv(key, `[文件] ${files.map((f) => f.name).join(", ")}`);
     log(`收到 ${key} 的文件: ${files.map((f) => f.name).join(", ")}（${humanSize(total)}）`);
     rememberFiles(key, files);
     await reply(
@@ -381,7 +717,9 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     return;
   }
 
-  // 「继续」：重放该会话上一条未完成的消息（重启前被强杀的那条）
+  // 「继续」不是新指令，而是用户对一条**确定内容**的待重放消息的决定——
+  // 合并它会让那条内容被改写（mergePrompt 会加前缀），而用户要的是
+  // 原样重跑。放前面，before 「继续」被合并判据当成普通消息吃掉。
   if (await handleRetry(event, text)) {
     done();
     return;
@@ -565,8 +903,7 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   //
   // 不限角色：不泄露任何内容，只是排队信息，谁问都一样。
   if (parseStatusCommand(text)) {
-    const cur = running.get(key);
-    // 要排除本条自己：这条消息在入队时已落盘（状态 queued），而
+    const cur = running.get(key);    // 要排除本条自己：这条消息在入队时已落盘（状态 queued），而
     // markRunning 在本函数更靠后的位置才执行——此刻它自己还挂在队列里。
     // 不排除的话，用户只发一条 /status 也会被告知「后面还有 1 条排队」，
     // 那 1 条就是这条命令本身。
@@ -584,6 +921,40 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     }
     if (depth) lines.push(`后面还有 ${depth} 条排队。`);
     await reply(lines.join("\n")).catch((e) => log("发送状态失败: " + e.message));
+    done();
+    return;
+  }
+
+  // /诊断：一次性查看「现在到底卡在哪」。仅 admin。
+  //
+  // 和 /status 一样必须走代码路径：问的正是"为什么没反应"，
+  // 走模型就得排在同一条串行队列后面，而队列被占满时正是它该回答问题的时候。
+  //
+  // /status 是它的轻量版（只管本会话的排队情况）；诊断是全局的，
+  // 覆盖进程、队列、会话体积、最后活动与依赖。两者都一毫秒返回。
+  if (parseDiagnosticCommand(text)) {
+    if (role !== "admin") {
+      await reply("诊断只在管理员私聊/群里可用。").catch((e) => log("发送权限提示失败: " + e.message));
+      done();
+      return;
+    }
+    if (diagnosing) {
+      await reply("正在生成上一份诊断，稍等一下。").catch(() => {});
+      done();
+      return;
+    }
+    diagnosing = true;
+    try {
+      const report = await collectDiagnostic(config.mergeWindowMs);
+      const sent = await reply(buildDiagnostic(report));
+      if (sent?.status !== "ok") log(`诊断发送失败: ${JSON.stringify(sent)}`);
+      else log("诊断报告已发送");
+    } catch (error) {
+      log(`诊断失败: ${error.stack || error.message}`);
+      await reply(`诊断失败：${String(error.message).slice(0, 120)}`).catch(() => {});
+    } finally {
+      diagnosing = false;
+    }
     done();
     return;
   }
@@ -623,6 +994,7 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   const prompt = preset?.prompt ?? (isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText);
 
   log(`收到 ${key}: ${truncate(prompt, 80)}`);
+  noteRecv(key, prompt);
 
   // 标记为执行中。此后进程若被强杀，这条会被启动恢复记入 pendingRetry
   // （不自动重放——可能已执行了一部分，交给用户回「继续」决定）。
@@ -724,6 +1096,8 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       role,
       model: config.claudeModel,
       abortSignal,
+      // 诊断里显示"谁在哪问的什么"，比一整段合并前缀好读得多
+      label: `${key} ${truncate(text.replace(/\s+/g, " "), 30)}`,
     });
 
   let result;
@@ -825,6 +1199,8 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   );
   if (sent?.status !== "ok") {
     log(`发送失败: ${JSON.stringify(sent)}`);
+  } else {
+    doneSinceBoot += 1; // 只有真正把结果发出去才算一条消息走完
   }
 
   // 压缩放到回复之后，且不 await —— 大会话要几分钟，不能让用户干等。
@@ -840,6 +1216,10 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
 }
 
 function runCompaction(key, sessionId) {
+  // 登记在案：压缩要跑好几分钟，期间该会话的下一条消息会明显变慢。
+  // 用户来问"怎么这么慢"时，诊断必须能说出"有一条压缩正在跑"，
+  // 否则只能看到一个空白的【执行】节。
+  compacting.set(key, { sessionId, startedAt: Date.now() });
   compactSession({
     exePath: config.claudeExe,
     baseUrl: config.claudeBaseUrl,
@@ -858,6 +1238,9 @@ function runCompaction(key, sessionId) {
     .catch((error) => {
       // 压缩失败不影响对话本身，下一轮还会再次尝试，所以只记日志
       log(`会话 ${sessionId.slice(0, 8)} 压缩失败: ${error.message}`);
+    })
+    .finally(() => {
+      compacting.delete(key);
     });
 }
 
@@ -944,7 +1327,45 @@ function promptTextFor(key, event) {
   return fresh.length ? withFiles(text, fresh) : text;
 }
 
+// 必须**立即**执行的命令，绝不能当普通消息处理。
+//
+// /诊断 和 /status 的存在意义就是"现在到底怎么了"——它们要是也被排进
+// 串行队列、或者被合并打断吃掉，就等于在用户最需要它们的时候失灵。
+// 实测踩到过：任务卡住时发 /诊断，它被合并进卡住的那条一起重跑，
+// 跑完才执行，而且执行了两次（原条 + 重跑条各一次，两次都命中命令分支）。
+//
+// 角色管理指令（加人/移出）同样必须确定性执行，不能等队列。
+function isDirectCommand(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return false;
+  if (parseDiagnosticCommand(t) || parseStatusCommand(t) || parseResetCommand(t)) return true;
+  if (/^\/提醒/.test(t)) return true;
+  return resolveRoleTarget({ text: t, mentionAts: [], selfId: config.selfId }) !== null;
+}
+
+// 正在跑的时候又来一条命令：直接摘掉条目独立执行。
+//
+// 不能让它走下面的队列轮询——那个轮询要等前面那条跑完才轮到，
+// 而"前面那条跑不完"正是用户要问的事。
+function runNow(event, entryId) {
+  if (entryId) removePending(entryId);
+  handleMessage(event, null, null, null).catch((error) =>
+    log(`处理异常: ${error.stack || error.message}`),
+  );
+}
+
 function startExec(key, event, entryId, prompt, sessionId) {
+  // 命令类消息在"已有任务在跑"时也要立刻执行，不走队列轮询。
+  //
+  // 对 /诊断 和 /status 这是必须的：它们回答"为什么还没回复"，
+  // 排队等前面跑完就正好错过了它们该回答的那一刻。
+  // 对加人/移出、/提醒 这类状态变更，即刻执行与 handleMessage 的语义一致
+  // （它们本来就是代码路径，不 spawn 模型）。
+  if (entryId && isDirectCommand(extractText(event.message))) {
+    runNow(event, entryId);
+    return;
+  }
+
   const controller = new AbortController();
   let resolveDone;
   const exec = {
@@ -984,7 +1405,14 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
 
   // 先试合并打断：只有在窗口内、且当前这条一个工具都没调过时才成立。
   // 判据在 interrupt.js，这里只负责取现场数据。
-  if (!fromRetry && config.mergeInterrupt) {
+  //
+  // 命令类消息（/诊断、/status 等）**不参与合并**：把它们并进正在跑的任务
+  // 一起重跑，等于让"查看现状"和"改变现状"绑在同一次执行上——实测表现为
+  // 诊断被吃掉、跑完才回答、而且回答两遍。命令应该立刻走自己的路径。
+  //
+  // 「继续」也不必在这里挡：handleRetry 早在 handleMessage 开头就把这种消息
+  // 消费掉了，能走到这里的「继续」只可能是没有待重放条目的普通闲聊词。
+  if (!fromRetry && config.mergeInterrupt && !isDirectCommand(text)) {
     const exec = execs.get(key);
     if (exec && shouldInterrupt({
       enabled: config.mergeInterrupt,

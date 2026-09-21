@@ -162,6 +162,7 @@ export function withSenderPrefix(text, event) {
 // 不能交给一个在工具被拒时会"编造执行结果"的模型去转述。
 const RESET_RE = /^\/(?:reset|清空|重置)$/;
 const STATUS_RE = /^\/(?:status|状态)$/;
+const DIAGNOSTIC_RE = /^\/诊断$/;
 
 export function parseResetCommand(text) {
   return RESET_RE.test((text || "").trim());
@@ -169,6 +170,12 @@ export function parseResetCommand(text) {
 
 export function parseStatusCommand(text) {
   return STATUS_RE.test((text || "").trim());
+}
+
+// /诊断：只认精确的「/诊断」，不认「/诊断 xxx」——
+// 诊断是只看不改的操作，任何带后缀的写法都说明用户想的是别的事，放给模型处理。
+export function parseDiagnosticCommand(text) {
+  return DIAGNOSTIC_RE.test((text || "").trim());
 }
 
 // 发送者角色：admin（QQ_ALLOWED_SENDERS，现状语义不变）、user（roles.json 名单）、null（陌生人）。

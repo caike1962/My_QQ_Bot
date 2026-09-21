@@ -1,5 +1,34 @@
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
+import { truncate } from "./session.js";
+
+// 活着/刚活过的 claude 子进程。给 /诊断 用。
+//
+// 为什么在这里登记而不是让 index.js 自己追踪：killTree 是所有 spawn 的
+// 天然收口（超时、合并打断都走它）。挂在 spawn 那一刻，将来新增的调用点
+// 不必记得登记也不会漏。
+//
+// 条目只在 close 时标成 done，不删除：诊断要回答的正是「有没有卡住/残留的
+// 进程」，一条刚跑完的记录（done=true）恰好是「它跑过、现在没了」的证据。
+// 数量有上限，>8 个时丢最老的记录。
+const PROC_HISTORY = 8;
+const procs = [];
+
+export function liveProcs() {
+  return procs.map((p) => ({ ...p }));
+}
+
+function noteSpawn(child, label) {
+  const rec = { pid: child.pid, startedAt: Date.now(), label, done: false };
+  procs.push(rec);
+  if (procs.length > PROC_HISTORY) procs.shift();
+  const mark = () => {
+    rec.done = true;
+  };
+  if (child.exitCode !== null || child.signalCode !== null) mark();
+  else child.once("close", mark);
+  return rec;
+}
 
 // 强杀整个进程树。
 //
@@ -147,6 +176,7 @@ export function runClaude({
   role = "admin",
   model,
   abortSignal,
+  label,
 }) {
   const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools, model });
 
@@ -177,6 +207,17 @@ export function runClaude({
       reject(new ClaudeError(`无法启动 claude: ${error.message}`));
       return;
     }
+
+    // 诊断标签优先用调用方给的可读描述（如「private:123 帮我查磁盘」）。
+    // 直接用 prompt 会在合并打断后打出一大段 [补充：…] 前缀，那一长串
+    // 对"这条为什么还没回"没有帮助，反而把真正的意图挤到看不见。
+    //
+    // 先压缩空白再截断：prompt 里的换行会毁掉报告排版，而截断必须用
+    // session.js 的 truncate（代理对安全），否则用户的中文/emoji 会被切成乱码。
+    noteSpawn(
+      child,
+      label || `对话：${truncate(String(prompt ?? "").replace(/\s+/g, " ").trim(), 30)}`,
+    );
 
     let stdout = "";
     let stderr = "";
@@ -254,7 +295,14 @@ export function runClaude({
       }
 
       if (timedOut) {
-        reject(new ClaudeError(`claude 超时（${Math.round(timeoutMs / 1000)}秒）`));
+        // 带上截止时的输出量：0 字符 = 进程起来了一条 JSON 都没吐，
+        // 有字符 = 它在干活只是没跑完。这两种超时该查的方向完全不同。
+        reject(
+          new ClaudeError(
+            `claude 超时（${Math.round(timeoutMs / 1000)}秒），` +
+              `截止时已收到 ${stdout.length} 字符 stdout / ${stderr.length} 字符 stderr`,
+          ),
+        );
         return;
       }
 
@@ -312,6 +360,15 @@ export function runClaude({
 //
 // 耗时较长（大会话可达数分钟），调用方务必给足超时。
 export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sessionId, timeoutMs = 600000, model }) {
+  // 这些参数直接进 spawn 的 args/env，运行时才报错的话进程已经起来了。
+  // 提前挡掉，顺带让 unit test 不必真的去 spawn。
+  if (!sessionId || typeof sessionId !== "string") {
+    return Promise.reject(new ClaudeError(`compact 需要 sessionId，收到 ${JSON.stringify(sessionId)}`));
+  }
+  if (!cwd || !existsSync(cwd) || !statSync(cwd).isDirectory()) {
+    return Promise.reject(new ClaudeError(`工作目录无效: ${cwd}（检查 QQ_CLAUDE_CWD）`));
+  }
+
   const args = [
     "-p",
     "/compact",
@@ -345,6 +402,8 @@ export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sess
       reject(new ClaudeError(`无法启动 claude compact: ${error.message}`));
       return;
     }
+
+    noteSpawn(child, `压缩会话 ${String(sessionId).slice(0, 8)}`);
 
     let stdout = "";
     let stderr = "";
