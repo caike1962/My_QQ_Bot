@@ -116,6 +116,31 @@ export function loadConfig() {
     // 设 0 = 立即回执（旧行为）。
     ackDelayMs: Math.max(0, Number(env.QQ_ACK_DELAY_MS) || 5000),
 
+    // ---- 合并打断：连发两条时，杀掉第一条正在跑的进程，两条合成一条重跑 ----
+    //
+    // 语义是**合并**不是放弃：第一条的内容原样保留在合并后的 prompt 里，
+    // 第二条作为补充一起处理。实现上只能是"杀进程 + 重跑"——无头 spawn
+    // 没有常驻进程可以收 ESC 信号。
+    //
+    // 只在 admin 私聊生效：群聊是共享会话，别人发言会被你的第二条消息
+    // 杀掉重跑，且两人同时打字必然互相打断。
+    mergeInterrupt: env.QQ_MERGE_INTERRUPT !== "false",
+
+    // 窗口（毫秒）。超过就不打断，第二条照常排队。
+    //
+    // 取 5s 有两个理由：一是主场景是"转发文件后补一句要求"，都在几秒内；
+    // 二是它**恰好不大于 ackDelayMs 的默认值**——合并总在「收到，正在处理…」
+    // 触发之前发生，被打断的那次运行根本不会发出回执，用户不会看到
+    // "正在处理"之后消息被撤掉重答的怪异现象。
+    //
+    // 但 5s 窗口本身不可能很大：实测单条短消息往返仅 2.3s，
+    // 窗口再大就会开始误伤已经跑完的回复。
+    mergeWindowMs: Math.max(0, Number(env.QQ_MERGE_WINDOW_MS) || 5000),
+
+    // 合并发生时是否告知用户。默认开——否则用户看到的是「收到，正在处理…」
+    // 之后突然换了个话题重答，像机器人失忆了。
+    mergeNotice: env.QQ_MERGE_NOTICE !== "false",
+
     maxTurns: Number(env.QQ_MAX_TURNS) || 15,
     timeoutMs: Number(env.QQ_TIMEOUT_MS) || 300000,
     mcpTimeoutMs: Number(env.QQ_MCP_TIMEOUT_MS) || 30000,

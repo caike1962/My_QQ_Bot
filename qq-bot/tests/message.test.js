@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   extractText,
+  extractFiles,
   extractAts,
   shouldHandle,
   stripLeadingMention,
@@ -656,4 +657,66 @@ test("extractAts: 异常输入返回空数组不抛错", () => {
     assert.deepEqual(extractAts(bad), [], `输入 ${JSON.stringify(bad)}`);
   }
   assert.deepEqual(extractAts([null, { type: "at" }, { type: "at", data: {} }]), []);
+});
+
+// ---------- extractFiles ----------
+//
+// 字段名以 NapCat 实测为准（2026-09-21，私聊转发一个 pdf）。
+// 三条最容易被猜错的：文件名在 `file` 而非 `name`；大小在 `file_size`；
+// 大小是**字符串**。
+const FILE_SEG = {
+  type: "file",
+  data: {
+    file: "图片转pdf_20260706_214225.pdf",
+    file_id: "80883569f95b09df4de35ea1c783c368_bf73abfa-b5af-11f1-9ec4-49bed69c7152",
+    file_size: "946642",
+  },
+};
+
+test("extractFiles: 实测的 NapCat 结构能被正确解出", () => {
+  const out = extractFiles([FILE_SEG]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].name, "图片转pdf_20260706_214225.pdf");
+  assert.equal(out[0].fileId, "80883569f95b09df4de35ea1c783c368_bf73abfa-b5af-11f1-9ec4-49bed69c7152");
+  assert.equal(out[0].size, 946642, "file_size 是字符串，必须转成数字");
+  assert.equal(typeof out[0].size, "number");
+});
+
+test("extractFiles: 文件段与文本段共存时只取文件", () => {
+  const out = extractFiles([
+    { type: "text", data: { text: "把这个放桌面" } },
+    FILE_SEG,
+  ]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].name, "图片转pdf_20260706_214225.pdf");
+});
+
+test("extractFiles: 缺 file_id 的段被跳过（取不到内容，收了没用）", () => {
+  assert.deepEqual(extractFiles([{ type: "file", data: { file: "a.pdf" } }]), []);
+});
+
+test("extractFiles: 缺文件名时给占位名而不是 undefined", () => {
+  const out = extractFiles([{ type: "file", data: { file_id: "x", file_size: "1" } }]);
+  assert.equal(out[0].name, "未命名文件");
+});
+
+test("extractFiles: 大小非法时为 null 而不是 NaN", () => {
+  const out = extractFiles([{ type: "file", data: { file_id: "x", file: "a.pdf", file_size: "abc" } }]);
+  assert.equal(out[0].size, null);
+});
+
+test("extractFiles: 无 file 段返回空数组", () => {
+  assert.deepEqual(extractFiles([{ type: "text", data: { text: "你好" } }]), []);
+  assert.deepEqual(extractFiles("你好"), []);
+});
+
+test("extractFiles: 异常输入不抛错", () => {
+  for (const bad of [null, undefined, 42, {}, true]) {
+    assert.deepEqual(extractFiles(bad), [], `输入 ${JSON.stringify(bad)}`);
+  }
+});
+
+test("extractText 不因文件段而改变行为（职责分离，老测试不受影响）", () => {
+  assert.equal(extractText([FILE_SEG]), "");
+  assert.equal(extractText([FILE_SEG, { type: "text", data: { text: "放桌面" } }]), "放桌面");
 });

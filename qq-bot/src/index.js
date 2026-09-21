@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
-import { extractText, extractAts, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
+import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified } from "./queue.js";
@@ -31,6 +31,30 @@ const sessions = loadSessions();
 
 // Claude Code 按工作目录划分项目，目录名是把 cwd 的非字母数字字符替换成 "-"
 const PROJECT_DIR = config.claudeCwd.replace(/[^A-Za-z0-9]/g, "-");
+
+// 某会话当前对应的磁盘文件。null 表示还没有会话（第一条消息）。
+function sessionPathFor(key) {
+  const sid = sessions.get(key);
+  return sid ? sessionPath(PROJECT_DIR, sid) : null;
+}
+
+// 解析本条消息该用什么 sessionId resume，顺带做体积治理。
+// 合并打断重跑时要复用它，否则被中断的那次从未把 sessionId 写回 map，
+// 重跑就会开一条全新会话，把之前的上下文全丢掉。
+function resolveSession(key) {
+  let sessionId = sessions.get(key) || null;
+  let compactPlan = null;
+  if (!sessionId) return { sessionId, compactPlan };
+
+  const prepared = prepareSession(sessionId);
+  sessionId = prepared.sessionId;
+  if (prepared.compact) compactPlan = { sessionId, sizeMb: prepared.sizeMb };
+  if (!sessionId) {
+    sessions.delete(key);
+    saveSessions();
+  }
+  return { sessionId, compactPlan };
+}
 
 // 在 --resume 之前处理会话体积，三级策略：
 //
@@ -94,6 +118,51 @@ let client;
 // 登记时机在 markRunning **之后**：先保证崩溃恢复的账本记上了，
 // 再对外宣称"在跑"。
 const running = new Map();
+
+// 刚收到的文件，等用户说要怎么处理。key → { files: [...], at }。
+//
+// 为什么需要缓存：QQ 把文件和处理要求拆成**两条独立消息**发（实测：先到
+// {"type":"file"}，再到 {"type":"text"}）。文字到达时，文件那条早已处理完，
+// 系统里没有任何状态记得它是什么——模型只能回「你说的『这个文件』我这边
+// 没有对应的对象」。
+//
+// 存的是 file_id 而不是下载 URL：实测同一个 file_id 两次解析得到的 URL
+// 不同（rkey 会变），存 URL 等到用的时候多半已经失效。
+const pendingFiles = new Map();
+const PENDING_FILE_TTL_MS = 5 * 60 * 1000;
+
+function rememberFiles(key, files) {
+  pendingFiles.set(key, { files, at: Date.now() });
+}
+
+// 取走该会话待处理的文件。过期的视为没有——用户隔了半小时才说要怎么处理，
+// 那条文件消息早就不在对话上下文里了，默默带上反而莫名其妙。
+function takeFiles(key) {
+  const entry = pendingFiles.get(key);
+  if (!entry) return [];
+  pendingFiles.delete(key); // 用掉即清，避免影响后面的无关消息
+  if (Date.now() - entry.at > PENDING_FILE_TTL_MS) return [];
+  return entry.files;
+}
+
+function humanSize(bytes) {
+  if (!Number.isFinite(bytes)) return "大小未知";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+// 把文件信息编进 prompt。必须给全 file_id —— 模型靠它调
+// get_private_file_url 才能真正把文件取下来，光给文件名它什么也做不了。
+function withFiles(text, files) {
+  const lines = files.map(
+    (f) => `- ${f.name}（${humanSize(f.size)}，file_id: ${f.fileId}）`,
+  );
+  return (
+    `[用户刚发来一个文件，信息如下：\n${lines.join("\n")}\n` +
+    `要取文件内容，用 get_private_file_url 传 file_id 拿下载地址，再下载。]\n${text}`
+  );
+}
 
 // 该会话上还没开始执行的消息条数（不含正在跑的那条）。
 //
@@ -261,6 +330,25 @@ async function handleMessage(event, entryId = null) {
     if (entryId) removePending(entryId);
   };
 
+  // 文件消息：先记住它，等用户下一条说要怎么处理。
+  //
+  // QQ 把文件和文字拆成两条独立消息发（实测），所以这里必须把 file_id 存下来，
+  // 否则下一条文字到达时，「这个文件」在系统里没有任何对应物。存完就返回——
+  // 这条消息本身没有可执行的内容。
+  const files = extractFiles(event.message);
+  if (files.length) {
+    const total = files.reduce((s, f) => s + (f.size || 0), 0);
+    log(`收到 ${key} 的文件: ${files.map((f) => f.name).join(", ")}（${humanSize(total)}）`);
+    rememberFiles(key, files);
+    await reply(
+      files.length === 1
+        ? `已收到「${files[0].name}」（${humanSize(files[0].size)}），要我怎么处理？`
+        : `已收到 ${files.length} 个文件（${humanSize(total)}），要我怎么处理？`,
+    ).catch((e) => log("发送文件确认失败: " + e.message));
+    done();
+    return;
+  }
+
   if (!text) {
     log(`来自 ${key} 的消息无文本内容，跳过`);
     done();
@@ -369,6 +457,30 @@ async function handleMessage(event, entryId = null) {
     return;
   }
 
+  // 带上刚才缓存的文件（用户先转发文件、再说要求时用）。
+  //
+  // 超长检查必须在 takeFiles **之前**做：takeFiles 是用掉即清，
+  // 检查失败时再想放回去就得重新拿，容易写出清空缓存的 bug。
+  let effectiveText = text;
+  {
+    const entry = pendingFiles.get(key);
+    const fresh = entry && Date.now() - entry.at <= PENDING_FILE_TTL_MS ? entry.files : [];
+    if (fresh.length) {
+      effectiveText = withFiles(text, fresh);
+      if (effectiveText.length > config.maxPromptChars) {
+        // 文件留在缓存里不动——用户下一条大概率仍然指代"这个文件"，
+        // 只是这条要求本身太长了。
+        await reply(
+          `消息太长了（${effectiveText.length} 字，含文件信息），请控制在 ${config.maxPromptChars} 字以内。`,
+        );
+        done();
+        return;
+      }
+      takeFiles(key); // 长度没问题，正式消费掉
+      log(`本条带上 ${fresh.length} 个待处理文件: ${fresh.map((f) => f.name).join(", ")}`);
+    }
+  }
+
   if (text.length > config.maxPromptChars) {
     await reply(`消息太长了（${text.length} 字），请控制在 ${config.maxPromptChars} 字以内。`);
     done();
@@ -376,7 +488,7 @@ async function handleMessage(event, entryId = null) {
   }
 
   // 共享会话里模型只能靠前缀知道是谁在说话。只在群聊加——私聊会话只有一个人。
-  const prompt = isGroup && config.senderPrefix ? withSenderPrefix(text, event) : text;
+  const prompt = isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText;
 
   log(`收到 ${key}: ${truncate(prompt, 80)}`);
 
@@ -386,6 +498,7 @@ async function handleMessage(event, entryId = null) {
 
   // 先记崩溃恢复的账（markRunning），再对用户宣称"在跑"。
   running.set(key, { what: prompt, started: Date.now() });
+
 
   // 立即回执：声明收到。"防止重复执行"这个承诺是安全的——从此刻起这条消息
   // 就在内存里了，进程不死它就一定会被执行（要么成功要么报错）。
@@ -450,16 +563,9 @@ async function handleMessage(event, entryId = null) {
 
   while (attempt < maxAttempts && !result) {
     attempt += 1;
-    let sessionId = sessions.get(key) || null;
-    if (sessionId) {
-      const prepared = prepareSession(sessionId);
-      sessionId = prepared.sessionId;
-      if (prepared.compact) compactPlan = { sessionId, sizeMb: prepared.sizeMb };
-      if (!sessionId) {
-        sessions.delete(key);
-        saveSessions();
-      }
-    }
+    const resolved = resolveSession(key);
+    const sessionId = resolved.sessionId;
+    if (resolved.compactPlan) compactPlan = resolved.compactPlan;
 
     try {
       result = await invoke(sessionId);
@@ -570,7 +676,7 @@ function enqueue(event, { fromRetry = false } = {}) {
   const prev = queues.get(key) || Promise.resolve();
   const next = prev
     .then(() => handleMessage(event, entryId))
-    .catch((error) => log(`处理异常: ${error.stack || error.message}`));
+    .catch((error) => log());
   queues.set(key, next);
   next.finally(() => {
     if (queues.get(key) === next) queues.delete(key);

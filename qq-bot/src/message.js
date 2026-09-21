@@ -18,6 +18,34 @@ export function extractText(message) {
   return "";
 }
 
+// 提取消息里的文件段。
+//
+// 字段名以 NapCat 实测为准（2026-09-21，私聊转发一个 pdf）：
+//   {"type":"file","data":{"file":"图片转pdf_20260706_214225.pdf",
+//                          "file_id":"80883569f95b09df4de35ea1c783c368_bf73...",
+//                          "file_size":"946642"}}
+// 注意三点：
+//   1. 文件名在 `file` 字段，不是 `name`
+//   2. 大小在 `file_size`，且是**字符串**，用时要转数字
+//   3. 拿文件内容必须靠 `file_id` 调 get_private_file_url，不能存 URL——
+//      实测同一个 file_id 两次解析得到的 URL 不同（rkey 会变），存 URL 会失效
+export function extractFiles(message) {
+  if (!Array.isArray(message)) return [];
+  const out = [];
+  for (const seg of message) {
+    if (seg?.type !== "file") continue;
+    const d = seg.data || {};
+    if (!d.file_id) continue; // 没有 file_id 就取不到内容，收了也没用
+    const size = Number(d.file_size);
+    out.push({
+      fileId: String(d.file_id),
+      name: String(d.file || "未命名文件"),
+      size: Number.isFinite(size) ? size : null,
+    });
+  }
+  return out;
+}
+
 // 对话隔离键。
 //
 // 群聊默认按**群**共享（groupShared=true）：所有人共用一条 Claude 会话，
