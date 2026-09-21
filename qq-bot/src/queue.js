@@ -7,6 +7,8 @@ import { readFileSync, writeFileSync, renameSync, statSync, existsSync, unlinkSy
 //   "queued"  → 进程在把它改成 running 之前就死了，确定**没执行过**，重放安全
 //   "running" → 可能已经跑了一部分，**不自动重放**（这台机器上真的会卸载软件、踢人），
 //               改为告知用户可回「继续」手动重放
+//   "notified"→ 已经告知过用户，用户还没回「继续」。停在终态不再动它——
+//               用户可能正在犹豫，或压根不打算重放，替他做决定等于擅自执行
 //
 // 体积超过 MAX_MB 直接整体丢弃：正常队列是个位数条目，触发上限说明严重积压
 // 或异常，此时宁可丢队列也不要让启动流程卡住。
@@ -91,6 +93,20 @@ export function removePending(id) {
   const entries = readAll();
   const left = entries.filter((e) => e.id !== id);
   if (left.length !== entries.length) writeAll(left);
+}
+
+// 把 running 标成「已告知」。必须在**发送通知之前**调用：
+// 发完再标的话，若在两者之间被强杀，下次启动还会再通知一遍。
+//
+// 标记本身不丢信息——条目仍在磁盘上，只是换了个终态名，
+// 用户回「继续」时照样能取到它的事件。
+export function markNotified(id) {
+  const entries = readAll();
+  const entry = entries.find((e) => e.id === id);
+  if (!entry || entry.status !== "running") return;
+  entry.status = "notified";
+  entry.at = Date.now();
+  writeAll(entries);
 }
 
 // 供启动恢复：把条目按到达顺序返回，交由调用方决定 queued 重放 / running 交由用户决定

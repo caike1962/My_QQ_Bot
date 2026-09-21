@@ -13,6 +13,7 @@ import {
   senderLabel,
   withSenderPrefix,
   parseResetCommand,
+  parseStatusCommand,
 } from "../src/message.js";
 
 // ---------- extractText ----------
@@ -471,6 +472,18 @@ test("resolveRoleTarget: 纯文本 @名字 退回名字解析", () => {
   assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: null, name: "钟总" });
 });
 
+test("resolveRoleTarget: 名字不带 @ 也走名字解析（自然写法）", () => {
+  const msg = [{ type: "text", data: { text: "@deepseek-v8 将钟总添加为用户" } }];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: null, name: "钟总" });
+});
+
+test("resolveRoleTarget: 名字两侧有空白、且是移出，同样解析得出名字", () => {
+  const msg = [{ type: "text", data: { text: "@deepseek-v8 将 成总 移出用户" } }];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "remove", qq: null, name: "成总" });
+});
+
 test("resolveRoleTarget: 直接写号码优先于 at 段", () => {
   const msg = [
     { type: "at", data: { qq: 3126747682 } },
@@ -587,6 +600,18 @@ test("parseResetCommand: 三种写法都识别，容忍空白", () => {
 test("parseResetCommand: 带参数的/普通文本不识别", () => {
   for (const bad of ["/reset now", "reset", "/清空会话", "帮我 /reset", "", null, undefined]) {
     assert.equal(parseResetCommand(bad), false, `"${bad}" 不应识别`);
+  }
+});
+
+test("parseStatusCommand: 两种写法都识别，容忍空白", () => {
+  for (const s of ["/status", " /status ", "/状态", "\t/status\n"]) {
+    assert.equal(parseStatusCommand(s), true, `"${s}" 应识别`);
+  }
+});
+
+test("parseStatusCommand: 带参数/普通文本不识别，且不会吃掉 /reset", () => {
+  for (const bad of ["/status now", "status", "/状态如何", "", null, undefined, "/reset"]) {
+    assert.equal(parseStatusCommand(bad), false, `"${bad}" 不应识别`);
   }
 });
 

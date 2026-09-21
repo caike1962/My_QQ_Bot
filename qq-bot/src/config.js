@@ -104,10 +104,26 @@ export function loadConfig() {
     // 共享会话下模型只能靠它区分是谁在说话，关掉请自行确认模型还能分清。
     senderPrefix: env.QQ_SENDER_PREFIX !== "false",
 
+    // 是否在收到消息时立即回执（「收到，正在处理…」），而不是等模型跑完才说话。
+    //
+    // 开（默认）：用户立刻知道消息没丢，等待期间还能发 /status 看进度。
+    //      代价是每条消息会多一条回复——短任务（秒级）尤其显得啰嗦。
+    // 关：退回等结果的一次性回复（旧行为）。
+    ackMessage: env.QQ_ACK_MESSAGE !== "false",
+
+    // 回执延迟（毫秒）。到点还没跑完才发「收到…」；跑完了就不发——
+    // 秒回的闲聊因此不会多出一句啰嗦的回执，长任务照样有反馈。
+    // 设 0 = 立即回执（旧行为）。
+    ackDelayMs: Math.max(0, Number(env.QQ_ACK_DELAY_MS) || 5000),
+
     maxTurns: Number(env.QQ_MAX_TURNS) || 15,
     timeoutMs: Number(env.QQ_TIMEOUT_MS) || 300000,
     mcpTimeoutMs: Number(env.QQ_MCP_TIMEOUT_MS) || 30000,
     maxPromptChars: Number(env.QQ_MAX_PROMPT_CHARS) || 4000,
+
+    // 回复长度上限（字符）。超长整条发会被 QQ 静默拒收，用户只看到回执、
+    // 等不到结果，所以宁可截断并说明。留了标明"被截断"那行的余量。
+    maxReplyChars: Number(env.QQ_MAX_REPLY_CHARS) || 3500,
 
     // 传给 claude 的 --model 值。**留空则完全不传该参数**（保持原有行为）。
     //

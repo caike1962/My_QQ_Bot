@@ -133,9 +133,14 @@ export function withSenderPrefix(text, event) {
 // 走代码路径而不是模型路径——删除会话映射必须确定性执行，
 // 不能交给一个在工具被拒时会"编造执行结果"的模型去转述。
 const RESET_RE = /^\/(?:reset|清空|重置)$/;
+const STATUS_RE = /^\/(?:status|状态)$/;
 
 export function parseResetCommand(text) {
   return RESET_RE.test((text || "").trim());
+}
+
+export function parseStatusCommand(text) {
+  return STATUS_RE.test((text || "").trim());
 }
 
 // 发送者角色：admin（QQ_ALLOWED_SENDERS，现状语义不变）、user（roles.json 名单）、null（陌生人）。
@@ -218,9 +223,11 @@ export function resolveRoleTarget({ text, mentionAts = [], selfId }) {
   });
   if (others.length) return { action, qq: number(others.at(-1).qq), name: null };
 
-  // 3. 名字兜底：文本以 @ 开头说明 at 段已被剥走，
-  //    （「将 @钟总 添加为用户」→「将@钟总 添加为用户」）
-  const named = t.match(/^将\s*@([^@\s]{1,24}?)\s*(?:添加为|移出)\s*用户$/);
+  // 3. 名字兜底：真的 @ 过对方时号码已在 at 段（第 2 步就返回了），
+  //    走到这里说明手上只剩一个名字。带不带 @ 符号都按名字去查成员列表——
+  //    「将钟总添加为用户」是多数人的自然写法，卡着 @ 不放只会把人推给模型，
+  //    白白多烧一轮上下文换一句「请补个 @」。
+  const named = t.match(/^将\s*@?([^@\s]{1,24}?)\s*(?:添加为|移出)\s*用户$/);
   if (named) return { action, qq: null, name: named[1] };
 
   // 意图成立但既没有号码也没有可查的名字（例如「将  添加为用户」），

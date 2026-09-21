@@ -2,10 +2,10 @@ import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
-import { extractText, extractAts, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand } from "./message.js";
-import { sessionPath, stripImages, truncate } from "./session.js";
+import { extractText, extractAts, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
+import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
-import { markQueued, markRunning, removePending, loadEntries, setQueueLogger } from "./queue.js";
+import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified } from "./queue.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -84,6 +84,24 @@ function saveSessions() {
 
 const queues = new Map();
 let client;
+
+// 每个会话当前在跑什么。key → { what, started }。
+//
+// 只在**本进程内存**里，不落盘——它的用途是回答「现在在忙什么」和「为什么
+// 我的消息还没被处理」，进程一重启这个问题的答案就变成「什么都没在跑」，
+// 重启前的状态另有 queue.js 的 pendingRetry 负责，两者职责不重叠。
+//
+// 登记时机在 markRunning **之后**：先保证崩溃恢复的账本记上了，
+// 再对外宣称"在跑"。
+const running = new Map();
+
+// 该会话上还没开始执行的消息条数（不含正在跑的那条）。
+//
+// 读磁盘而不是内存计数：重启恢复时排队的条目也计入，而内存计数只知道
+// 重启之后的事——用户恰恰是在"刚重启、消息还没跑"的时候最需要这个数字。
+function queueDepth(key) {
+  return loadEntries().filter((e) => e.key === key && e.status === "queued").length;
+}
 
 // 重启时留下的、状态未知的消息（key → 原始事件）。
 //
@@ -328,6 +346,29 @@ async function handleMessage(event, entryId = null) {
     return;
   }
 
+  // /status：这个会话现在在忙什么、后面排了几条。
+  //
+  // 也是代码路径。走模型的话，得排在同一条串行队列后面才轮得到它——
+  // 而用户问「怎么还没好」的时候，正是队列被占满的时候，等于永远问不出答案。
+  //
+  // 不限角色：不泄露任何内容，只是排队信息，谁问都一样。
+  if (parseStatusCommand(text)) {
+    const cur = running.get(key);
+    const depth = queueDepth(key);
+    const lines = [];
+    if (cur) {
+      const secs = Math.round((Date.now() - cur.started) / 1000);
+      lines.push(`正在执行：${truncate(cur.what, 40)}`);
+      lines.push(`已运行 ${secs} 秒${secs > config.timeoutMs / 1000 ? "（已超时，即将被中止）" : ""}`);
+    } else {
+      lines.push("当前没有正在执行的任务。");
+    }
+    if (depth) lines.push(`后面还有 ${depth} 条排队。`);
+    await reply(lines.join("\n")).catch((e) => log("发送状态失败: " + e.message));
+    done();
+    return;
+  }
+
   if (text.length > config.maxPromptChars) {
     await reply(`消息太长了（${text.length} 字），请控制在 ${config.maxPromptChars} 字以内。`);
     done();
@@ -342,6 +383,47 @@ async function handleMessage(event, entryId = null) {
   // 标记为执行中。此后进程若被强杀，这条会被启动恢复记入 pendingRetry
   // （不自动重放——可能已执行了一部分，交给用户回「继续」决定）。
   if (entryId) markRunning(entryId);
+
+  // 先记崩溃恢复的账（markRunning），再对用户宣称"在跑"。
+  running.set(key, { what: prompt, started: Date.now() });
+
+  // 立即回执：声明收到。"防止重复执行"这个承诺是安全的——从此刻起这条消息
+  // 就在内存里了，进程不死它就一定会被执行（要么成功要么报错）。
+  // 回执：到点还没跑完才发。跑完了就不发——秒回的闲聊因此不会多出一句
+  // 啰嗦的「收到」。
+  //
+  // depth 要减 1：排队命令在上一轮末才发起，任务跑得快时它很可能还没返回，
+  // 队列里仍有本条自己，不减就会把"自己"算成"正在排队"。
+  let ackTimer = null;
+  let ackSent = null; // 回执发送的 Promise，收尾时要等它落地
+  if (config.ackMessage) {
+    const who = senderLabel(event);
+    ackTimer = setTimeout(() => {
+      const depth = Math.max(0, queueDepth(key) - 1);
+      const text = isGroup
+        ? `收到${who ? `，${who}` : ""}，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`
+        : `收到，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`;
+      ackSent = reply(text)
+        .then((sent) => {
+          if (sent?.status !== "ok") log(`发送回执失败: ${JSON.stringify(sent)}`);
+        })
+        .catch((e) => log("发送回执失败: " + e.message));
+    }, config.ackDelayMs);
+  }
+
+  // 任务收尾：停掉还没触发的回执，并等已发出的那条落地。
+  //
+  // 只 clearTimeout 不够——定时器可能刚触发、回执还在发送途中，不等它就发结果，
+  // 「正在处理」会落在结果之后，看起来像机器人失忆了。（等它的代价很小：
+  // 结果是本地的 WS 调用，通常几毫秒。）
+  //
+  // 结果消息**不再**附「（回 X）」——群里回复本来就用 @ 指明了对象
+  // （replyToSender），再加一句只是重复。
+  const settle = async () => {
+    if (ackTimer) clearTimeout(ackTimer);
+    ackTimer = null;
+    if (ackSent) await ackSent;
+  };
 
   const invoke = (sessionId) =>
     runClaude({
@@ -399,6 +481,8 @@ async function handleMessage(event, entryId = null) {
 
       if (attempt >= maxAttempts) {
         log(`处理失败: ${detail}`);
+        running.delete(key);
+        await settle();
         await reply(`抱歉，处理出错了：${detail.slice(0, 120)}`).catch((e) =>
           log("发送错误提示失败: " + e.message),
         );
@@ -417,11 +501,23 @@ async function handleMessage(event, entryId = null) {
   // 若发送成功但摘除失败，重启后这条仍是 running → 进 pendingRetry，
   // 最多让用户回一次「继续」重放；反过来则会重复发送。
   done();
+  running.delete(key);
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+  await settle();
   log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${truncate(result.text, 80)}`);
 
-  const sent = await reply(result.text);
+  // 超长回复不能整条发出去：QQ 侧会被静默拒收（retcode 会报 10062 之类的
+  // 参数错误），用户只看到一句回执、等不到结果。这里明确降级并告知。
+  //
+  // 用 Array.from 按码点算长度：模型爱用 emoji，而 QQ 的长度限制也按字符算。
+  const len = Array.from(result.text).length;
+  const sent = await reply(
+    len > config.maxReplyChars
+      ? Array.from(result.text).slice(0, config.maxReplyChars).join("") +
+          `\n\n（回复太长被截断，共 ${len} 字）`
+      : result.text,
+  );
   if (sent?.status !== "ok") {
     log(`发送失败: ${JSON.stringify(sent)}`);
   }
@@ -471,7 +567,8 @@ function enqueue(event, { fromRetry = false } = {}) {
   // 让从未执行过的后续消息在恢复时被误判为「状态未知」而不能自动重放。
   const entryId = fromRetry ? null : markQueued(key, event);
 
-  const prev = queues.get(key) || Promise.resolve();  const next = prev
+  const prev = queues.get(key) || Promise.resolve();
+  const next = prev
     .then(() => handleMessage(event, entryId))
     .catch((error) => log(`处理异常: ${error.stack || error.message}`));
   queues.set(key, next);
@@ -491,8 +588,9 @@ log(
   `启动: bot=${config.selfId} 角色管理=开` +
     ` admin=[${config.allowedSenders.join(",") || "无(全部按 admin)"}]` +
     ` user=[${loadRoles().users.join(",") || "无"}]` +
-    ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}], 会话=${config.groupSharedSession ? "按群共享" : "按群+人隔离"})` : ""} ` +
-    `工具数=${config.allowedTools.split(",").length} 超时=${config.timeoutMs / 1000}s`,
+    ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}], 会话=${config.groupSharedSession ? "按群共享" : "按群+人隔离"})` : " "}` +
+    ` 回执=${config.ackMessage ? `开(延迟${config.ackDelayMs / 1000}s)` : "关"}` +
+    ` 工具数=${config.allowedTools.split(",").length} 超时=${config.timeoutMs / 1000}s`,
 );
 
 // 恢复上次进程留下的队列。
@@ -519,7 +617,13 @@ async function restoreQueue() {
   if (!entries.length) return;
 
   const queued = entries.filter((e) => e.status === "queued");
-  const interrupted = entries.filter((e) => e.status !== "queued");
+  const interrupted = entries.filter((e) => e.status === "running");
+  // "notified" 是终态：用户已经被告知过，还没回「继续」。不再重复通知——
+  // 否则每次重启都对着同一批消息唠叨一遍（实测被烦了两次才发现）。
+  const waiting = entries.filter((e) => e.status !== "queued" && e.status !== "running");
+  if (waiting.length) {
+    log(`${waiting.length} 条消息在等用户回「继续」，不再重复通知`);
+  }
 
   for (const e of queued) {
     log(`恢复未处理消息 ${e.key}: ${truncate(extractText(e.event.message), 60)}`);
@@ -527,11 +631,34 @@ async function restoreQueue() {
   }
 
   for (const e of interrupted) {
+    // 先确认这轮**真的**没跑完。status=running 只说明"没来得及从队列摘除"，
+    // 而进程被强杀时，绝大多数任务其实已经在会话文件里跑完了（结果都发出去了）。
+    // 无脑通知会让每次重启都误报一次，用户很快就不看了，真正的丢消息反被淹没。
+    const sid = sessions.get(e.key);
+    const completed = sid
+      ? sessionCompleted(sessionPath(PROJECT_DIR, sid))
+      : null;
+    if (completed === true) {
+      log(`丢弃 ${e.key} 的残留条目：会话里这轮已经跑完（结果早已发出）`);
+      removePending(e.id);
+      continue;
+    }
+
     pendingRetry.set(e.key, e.event);
+
+    // 断在哪一步：会话里悬空的工具调用。光说"没处理完"用户没法判断
+    // 该不该回「继续」，列出最后几步它才有依据——尤其那种"改到一半停下"的任务。
+    const detail = sid
+      ? pendingSummary(readSessionDelta(sessionPath(PROJECT_DIR, sid)))
+      : "";
+
     const isGroup = e.event.message_type === "group";
+    const message = `刚才那条消息没处理完（我重启过）${detail}\n回「继续」我就重新执行它。`;
     const params = isGroup
-      ? { group_id: Number(e.event.group_id), message: "刚才那条消息没处理完（我重启过），回「继续」我就重新执行它。" }
-      : { user_id: Number(e.event.user_id), message: "刚才那条消息没处理完（我重启过），回「继续」我就重新执行它。" };
+      ? { group_id: Number(e.event.group_id), message }
+      : { user_id: Number(e.event.user_id), message };
+    // 先标记再发送：反过来的话，卡在两者之间被强杀，下次启动还会再通知一遍
+    markNotified(e.id);
     try {
       const sent = await sendWhenConnected(isGroup ? "send_group_msg" : "send_private_msg", params);
       if (sent?.status !== "ok") log(`发送恢复提示失败: ${JSON.stringify(sent)}`);
