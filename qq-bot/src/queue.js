@@ -89,6 +89,26 @@ export function markRunning(id) {
   writeAll(entries);
 }
 
+// 记下"本条开始执行时会话文件的行数"。
+//
+// 重启恢复靠它判断一条 running 条目到底是**压根没跑**还是**跑过一部分**：
+// 文件没长过 = 模型连一次工具都没调 = 重放零副作用，可以自动恢复；
+// 长过 = 已经动过工具，可能踢了人、卸了软件，绝不能猜。
+//
+// 必须在本进程、claude 还没启动时调用——spawn 后 CLI 会立刻写约 4 行
+// 记账记录，那时取就分不清"记账"和"模型真的动了工具"。调用点放在
+// markRunning 之后、invoke 之前，中间没有 await。
+//
+// baseline 为 null 表示"取不到"（文件不存在等），恢复时按不安全处理。
+export function markBaseline(id, lines) {
+  const entries = readAll();
+  const entry = entries.find((e) => e.id === id);
+  if (!entry || entry.status !== "running") return;
+  if (entry.baseline !== undefined) return; // 幂等，不覆盖已记下的锚点
+  entry.baseline = Number.isFinite(lines) ? lines : null;
+  writeAll(entries);
+}
+
 export function removePending(id) {
   const entries = readAll();
   const left = entries.filter((e) => e.id !== id);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, lastRecordType } from "../src/session.js";
+import { stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, lastRecordType, decideRecovery } from "../src/session.js";
 
 const BIG = "A".repeat(50_000); // 模拟 base64 图片
 
@@ -553,4 +553,45 @@ test("lastRecordType: 空文件返回 null", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------- decideRecovery ----------
+//
+// 自动恢复的安全闸门：只有能证明"没动过工具"才自动重放。
+
+test("decideRecovery: 会话没增长 → 自动重放", () => {
+  const r = decideRecovery({ baseline: 100, currentLines: 100 });
+  assert.equal(r.resume, true);
+  assert.equal(r.reason, "untouched");
+});
+
+test("decideRecovery: 会话增长了 → 不自动重放（可能动过工具）", () => {
+  const r = decideRecovery({ baseline: 100, currentLines: 137 });
+  assert.equal(r.resume, false);
+  assert.equal(r.reason, "touched");
+  assert.equal(r.grew, 37);
+});
+
+test("decideRecovery: baseline 为 null → 不安全", () => {
+  for (const b of [null, undefined]) {
+    assert.equal(decideRecovery({ baseline: b, currentLines: 100 }).resume, false);
+  }
+});
+
+test("decideRecovery: 现在读不到文件 → 不安全（无从证明）", () => {
+  const r = decideRecovery({ baseline: 100, currentLines: null });
+  assert.equal(r.resume, false);
+  assert.equal(r.reason, "unreadable");
+});
+
+test("decideRecovery: 文件变短也算变过，不重放", () => {
+  // 行数减少说明文件被动过（换会话/清空），同样不能证明没执行过
+  const r = decideRecovery({ baseline: 100, currentLines: 50 });
+  assert.equal(r.resume, false);
+  assert.equal(r.reason, "changed");
+});
+
+test("decideRecovery: 恰好相等才算没动过（边界）", () => {
+  assert.equal(decideRecovery({ baseline: 0, currentLines: 0 }).resume, true);
+  assert.equal(decideRecovery({ baseline: 100, currentLines: 101 }).resume, false);
 });

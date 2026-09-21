@@ -3,9 +3,9 @@ import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
 import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
-import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType } from "./session.js";
+import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
-import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted } from "./queue.js";
+import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
@@ -631,6 +631,21 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   // 先记崩溃恢复的账（markRunning），再对用户宣称"在跑"。
   running.set(key, { what: prompt, started: Date.now() });
 
+  // 恢复判据的锚点：本条开始执行时会话文件的行数。
+  //
+  // 同步取，且此刻 claude 还没 spawn——CLI 一启动就会写约 4 行记账记录，
+  // 那时取就分不清"记账"和"模型真的动了工具"。
+  //
+  // 取不到会话 ID 时写 null：恢复时按"不安全"处理，绝不猜。
+  // 宁可多问用户一次，也不能对着已经踢过人的任务重放。
+  if (entryId) {
+    const anchorSid = preset?.sessionId ?? sessions.get(key) ?? null;
+    markBaseline(
+      entryId,
+      anchorSid ? sessionLineCount(sessionPath(PROJECT_DIR, anchorSid)) : null,
+    );
+  }
+
   // 合并判据的锚点：本条开始执行时会话文件的行数。null = 还没建立
   // （claude 启动约 0.6s 后才写完记账记录），此时判据退化为"有没有超过
   // spawn 时的行数"——同样安全，因为那一刻模型必然还没动过工具。
@@ -1143,6 +1158,28 @@ async function restoreQueue() {
       continue;
     }
 
+    // 跑过、但确实没跑完（没到 cost-state）。到这里只剩两种可能，
+    // 而它们的代价差着数量级，必须分开：
+    //
+    //   没动过工具（会话文件相对 baseline 没长）→ 重放零副作用，**自动恢复**
+    //   动过了                                 → 可能踢了人、卸了软件 → 交给用户
+    //
+    // 自动恢复这条同时补上了一个老缺口：命令类消息（/提醒、/status）
+    // 压根不写会话，末尾永远不是 cost-state，所以上面那条静默清理覆盖不到它，
+    // 每次重启都会被当成"没跑完"通知一遍。现在它们会被自动重放，不再唠叨。
+    const anchor = sessions.get(e.key);
+    const anchorPath = anchor ? sessionPath(PROJECT_DIR, anchor) : null;
+    const decision = decideRecovery({
+      baseline: e.baseline,
+      currentLines: anchorPath ? sessionLineCount(anchorPath) : null,
+    });
+    if (decision.resume) {
+      log(`自动恢复 ${e.key}：会话未增长，这轮没动过工具，重放零副作用`);
+      enqueue(e.event, { fromRetry: true, replayId: e.id });
+      continue;
+    }
+
+    // 到这里才是真的"可能做了一半"，交给用户决定。
     pendingRetry.set(e.key, e.event);
 
     // 断在哪一步：会话里悬空的工具调用。光说"没处理完"用户没法判断

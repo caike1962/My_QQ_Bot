@@ -188,6 +188,36 @@ export function readSessionDelta(filePath, fromLine = 0, { limit = MAX_CALLS } =
   };
 }
 
+// 一条 running 条目重启后能不能自动重放。
+//
+// 这是整个自动恢复的安全闸门，判据只有一个：**这轮消息到底执行过没有**。
+//
+//   会话文件相对 baseline 没长过 → 模型连一次工具都没调 → 重放零副作用
+//   长过了                     → 可能已经踢了人、卸了软件 → 只能交给用户
+//
+// 为什么这条判据可信：实测无头 spawn 的写入时间线里，模型生成文本期间
+// **不写文件**，文件只在工具调用前后增长（见 interrupt.js 的实测记录）。
+// 所以"行数没变"确实等价于"没动过工具"，而不是"可能动过但没记下来"。
+//
+// baseline 为 null 一律判不安全：取不到锚点说明消息可能在 spawn 之前就死了，
+// 也可能只是文件路径有问题——两种都无从证明，不猜。
+export function decideRecovery({ baseline, currentLines }) {
+  if (baseline === null || baseline === undefined) {
+    return { resume: false, reason: "no-baseline" };
+  }
+  if (currentLines === null) {
+    // 现在读不到文件，但当初记下的 baseline 是有效数字——文件多半被换过
+    // 或删了，无从证明没执行过
+    return { resume: false, reason: "unreadable" };
+  }
+  if (currentLines !== baseline) {
+    // 增长 = 写了新记录（可能调过工具）；变短 = 文件被动过（换会话/清空）。
+    // 两者都证明"现在的文件"和"记锚点时的文件"不是同一个，无从判断执行到哪。
+    return { resume: false, reason: currentLines > baseline ? "touched" : "changed", grew: currentLines - baseline };
+  }
+  return { resume: true, reason: "untouched" };
+}
+
 // 会话最后一条记录的 type。
 //
 // 用途：判断某个"待确认"的队列条目到底是真丢了任务、还是通知误报。
