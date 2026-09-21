@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSyn
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
-import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, senderLabel } from "./message.js";
+import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, setQueuePath, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
@@ -1255,12 +1255,12 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   let ackTimer = null;
   let ackSent = null; // 回执发送的 Promise，收尾时要等它落地
   if (config.ackMessage) {
-    const who = senderLabel(event);
     ackTimer = setTimeout(() => {
       const depth = Math.max(0, queueDepth(key) - 1);
-      const text = isGroup
-        ? `收到${who ? `，${who}` : ""}，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`
-        : `收到，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`;
+      // 不带发送者称呼：群里 reply() 已经用 [CQ:at,qq=...] 指明了对象，
+      // 再加一句「[蔡总(1765116032)]」是同一件事说两遍。
+      // 私聊更不必说——会话里本来就只有一个人。
+      const text = `收到，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`;
       ackSent = reply(text)
         .then((sent) => {
           if (sent?.status !== "ok") log(`发送回执失败: ${JSON.stringify(sent)}`);
