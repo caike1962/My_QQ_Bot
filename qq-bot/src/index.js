@@ -7,6 +7,8 @@ import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta,
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
+import { parseReminder } from "./reminders.js";
+import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -178,9 +180,17 @@ function withFiles(text, files) {
 //   running  正在跑，不算排队
 //   merging  已被合并进正在跑的那条，内容已保留，不算排队
 //   queued   真的在等，算
-function queueDepth(key) {
+//
+// excludeId 用来排除"调用方自己那条"。命令类消息（/status 等）是在
+// 入队之后、markRunning 之前执行的，此刻它自己的条目状态还是 queued，
+// 不排除就会被算成"后面有一条排队"——那一条其实是命令自己。
+// 按 id 排除而不是让调用方减 1：条目可能已被合并/摘除，减 1 会算少。
+function queueDepth(key, excludeId = null) {
   return loadEntries().filter(
-    (e) => e.key === key && (e.status === "queued" || e.status === "merging"),
+    (e) =>
+      e.key === key &&
+      e.id !== excludeId &&
+      (e.status === "queued" || e.status === "merging"),
   ).length;
 }
 
@@ -422,6 +432,104 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     }
   }
 
+  // /提醒：定时提醒的增删查（仅 admin）。
+  //
+  // 走代码路径而非模型路径：写 jobs.json 是状态变更，与「加人/移出用户」
+  // 同理，必须确定性执行。模型这边只负责理解自然语言意图，落到具体时间字段
+  // 由 reminders.js 的解析器做。
+  //
+  // 为什么把「解析 + 落盘」都放在代码里：定时任务一旦写错时间，用户是
+  // 在错过提醒之后才发现，而那时已经没法补救。宁可解析器拒绝并要求改写，
+  // 也不要模型"猜一个差不多的时间"。
+  if (/^\/提醒/.test(text.trim())) {
+    if (role !== "admin") {
+      await reply("只有管理员能设置定时提醒。").catch((e) => log("发送权限提示失败: " + e.message));
+      done();
+      return;
+    }
+
+    const body = text.trim().replace(/^\/提醒\s*/, "").trim();
+
+    // 列表
+    if (body === "列表" || body === "") {
+      const jobs = loadJobs(config.jobsPath);
+      if (!jobs.length) {
+        await reply("当前没有定时任务。\n添加：/提醒 每天 08:00 起床").catch((e) => log("发送失败: " + e.message));
+        done();
+        return;
+      }
+      const lines = jobs.map((j, i) => {
+        const when = j.date ? `${j.date} ${j.time}` : j.time;
+        const repeat = j.weekdays?.length
+          ? `周${j.weekdays.map((d) => "日一二三四五六"[d]).join("、")}`
+          : j.date
+            ? "一次性"
+            : "每天";
+        const where = j.target?.type === "group" ? `群${j.target.id}` : "私聊";
+        const what = String(j.text ?? j.prompt ?? "").slice(0, 20);
+        return `${i + 1}. ${when}（${repeat}，${where}）${what}`;
+      });
+      await reply(`共 ${jobs.length} 条定时任务：\n${lines.join("\n")}\n\n删除：/提醒删除 序号`).catch(
+        (e) => log("发送失败: " + e.message),
+      );
+      done();
+      return;
+    }
+
+    // 删除
+    const del = /^(?:删除|取消)\s*(\d+)$/.exec(body);
+    if (del) {
+      const removed = removeJobByIndex(config.jobsPath, Number(del[1]));
+      await reply(
+        removed
+          ? `已删除提醒：${removed.time} ${String(removed.text ?? "").slice(0, 20)}`
+          : `没有第 ${del[1]} 条，发「/提醒 列表」看看现有任务。`,
+      ).catch((e) => log("发送失败: " + e.message));
+      done();
+      return;
+    }
+
+    // 新增
+    const parsed = parseReminder(text);
+    if (parsed.error) {
+      await reply(`${parsed.error}\n\n写法示例：\n/提醒 每天 08:00 起床\n/提醒 工作日 09:30 开站会\n/提醒 明天 15:00 开会\n/提醒 2026-10-01 08:00 出发`).catch(
+        (e) => log("发送失败: " + e.message),
+      );
+      done();
+      return;
+    }
+
+    const job = {
+      // name 用时间戳而非用户输入：中文内容不适合做键名，
+      // 而且同名任务会被 addJob 去重覆盖——用户想要的通常是"再加一条"。
+      name: `r${Date.now()}`,
+      time: parsed.job.time,
+      text: parsed.job.text,
+      // 触发地 = 当前会话所在地：在哪问的就在哪推。
+      target: isGroup ? { type: "group", id: Number(event.group_id) } : { type: "private", id: userId },
+    };
+    if (parsed.job.date) job.date = parsed.job.date;
+    if (parsed.job.weekdays) job.weekdays = parsed.job.weekdays;
+
+    try {
+      addJob(config.jobsPath, job);
+      const repeat = job.weekdays
+        ? `每周${job.weekdays.map((d) => "日一二三四五六"[d]).join("、")}`
+        : job.date
+          ? `${job.date} 仅一次`
+          : "每天";
+      log(`新增定时提醒 ${job.name}: ${job.time} ${job.text}`);
+      await reply(`好的，${repeat} ${job.time} 提醒你：${job.text}\n（发「/提醒 列表」可查看，发「/提醒删除 序号」可取消）`).catch(
+        (e) => log("发送确认失败: " + e.message),
+      );
+    } catch (error) {
+      log(`写入定时任务失败: ${error.message}`);
+      await reply(`设置提醒失败：${String(error.message).slice(0, 120)}`).catch((e) => log("发送失败: " + e.message));
+    }
+    done();
+    return;
+  }
+
   // /reset：清空当前会话上下文（仅 admin）。
   //
   // 走代码路径而不是模型路径：共享会话后上下文是全群可见的，重置必须
@@ -458,7 +566,14 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   // 不限角色：不泄露任何内容，只是排队信息，谁问都一样。
   if (parseStatusCommand(text)) {
     const cur = running.get(key);
-    const depth = queueDepth(key);
+    // 要排除本条自己：这条消息在入队时已落盘（状态 queued），而
+    // markRunning 在本函数更靠后的位置才执行——此刻它自己还挂在队列里。
+    // 不排除的话，用户只发一条 /status 也会被告知「后面还有 1 条排队」，
+    // 那 1 条就是这条命令本身。
+    //
+    // 按 entryId 排除而不是 queueDepth - 1：合并打断会让队列里出现
+    // 状态为 merging 的条目，减 1 在那种情况下会少算。
+    const depth = queueDepth(key, entryId);
     const lines = [];
     if (cur) {
       const secs = Math.round((Date.now() - cur.started) / 1000);
@@ -841,12 +956,16 @@ function startExec(key, event, entryId, prompt, sessionId) {
 // 按**条目**（id）而非按 key 追踪：同一会话可能积压多条（用户连发），
 // 同一时刻只有队首在执行；按 key 标记会把整批都标成执行中，
 // 让从未执行过的后续消息在恢复时被误判为「状态未知」而不能自动重放。
-function enqueue(event, { fromRetry = false } = {}) {
+// replayId：重放**已经落盘**的条目时，把它自己的 id 传进来接手后续状态流转
+// （markRunning / removePending 都认这个 id）。传 null 就会彻底脱管——
+// 条目永远停在 queued，每次启动都被重放一遍，并把 queueDepth 永久撑大。
+// 「继续」路径传 null 是对的：那条是 notified 终态，本就不该再计数。
+function enqueue(event, { fromRetry = false, replayId = null } = {}) {
   const key = convKey(event);
 
   // 入队即落盘：pm2 用 taskkill /F 强杀（不发信号），这一步是「消息已收到」
-  // 唯一的持久化机会。重放不计入队列，否则「继续」会让条目反复堆积。
-  const entryId = fromRetry ? null : markQueued(key, event);
+  // 唯一的持久化机会。重放不再落新条目（markQueued），否则会反复堆积。
+  const entryId = fromRetry ? replayId : markQueued(key, event);
 
   // 先试合并打断：只有在窗口内、且当前这条一个工具都没调过时才成立。
   // 判据在 interrupt.js，这里只负责取现场数据。
@@ -972,7 +1091,10 @@ async function restoreQueue() {
 
   for (const e of queued) {
     log(`恢复未处理消息 ${e.key}: ${truncate(extractText(e.event.message), 60)}`);
-    enqueue(e.event, { fromRetry: true });
+    // 带上 e.id：这条条目已经在磁盘上了，必须由它自己走到终态。
+    // 不传的话 entryId 为 null，done() 摘不掉它——它会永远停在 queued，
+    // 每轮启动重放一次、每次都把「后面还有 N 条排队」撑大（实测就是这样）。
+    enqueue(e.event, { fromRetry: true, replayId: e.id });
   }
 
   for (const e of interrupted) {
@@ -1016,6 +1138,10 @@ async function restoreQueue() {
 
 client.connect();
 restoreQueue().catch((error) => log(`队列恢复失败: ${error.message}`));
+
+// 定时推送。放在 connect 之后：调度器发送时要经 client，虽然它自带
+// 未连接重试，但启动即触发的那次检查等连上更稳妥。
+startScheduler({ client, config, log });
 
 function shutdown(signal) {
   log(`收到 ${signal}，退出中`);

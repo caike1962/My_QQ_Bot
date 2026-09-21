@@ -181,5 +181,9 @@ export function loadConfig() {
 
     // compact 的超时。大会话要几分钟，给足余量，否则压缩到一半被杀。
     compactTimeoutMs: Number(env.QQ_COMPACT_TIMEOUT_MS) || 600000,
+
+    // 定时任务的配置文件。调度器每 20s 读一次，所以改完这个文件
+    // **不需要重启**（与其它配置项不同）。
+    jobsPath: env.QQ_JOBS_PATH || "D:\\QQBOT\\qq-bot\\jobs.json",
   };
 }
