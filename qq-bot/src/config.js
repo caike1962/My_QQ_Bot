@@ -148,7 +148,29 @@ export function loadConfig() {
 
     // 回复长度上限（字符）。超长整条发会被 QQ 静默拒收，用户只看到回执、
     // 等不到结果，所以宁可截断并说明。留了标明"被截断"那行的余量。
+    //
+    // 注意：这是**最后兜底**，不是第一道处理。超过 reportThreshold 的回复
+    // 会走 HTML 文件发送（见下面），只有文件也发不出去时才落到这个截断。
     maxReplyChars: Number(env.QQ_MAX_REPLY_CHARS) || 3500,
+
+    // ---- 长回复改走 HTML 文件 ----
+    //
+    // 超过 reportFileThreshold 字的回复不截断，而是渲染成 HTML 文件发给用户。
+    // 为什么是 HTML 而不是 txt：手机端 txt 附件要点开→下载→用外部应用打开，
+    // 而 HTML 可以直接用浏览器打开，排版（段落、列表、深色模式）都在。
+    //
+    // 为什么不是 Markdown：实测 41 条长回复里 0 条用了 `#` 标题或代码块，
+    // 模型输出的是纯中文散文——写一整套 Markdown 渲染不划算。详见 html-report.js。
+    //
+    // 关掉它就退回旧的"截断"行为。
+    reportFile: env.QQ_REPORT_FILE !== "false",
+
+    // 触发走文件的字数阈值（按码点算）。
+    //
+    // 取 2000 而不是沿用 maxReplyChars 的 3500：3500 是"发不出去"的物理上限，
+    // 而 2000 更接近"手机上滚动看会觉得长"的界限。阈值低了风险是频繁弹文件
+    // （体验变重），高了则是继续发超长消息（体验变差），2000 是二者的折中。
+    reportFileThreshold: Number(env.QQ_REPORT_THRESHOLD) || 2000,
 
     // 传给 claude 的 --model 值。**留空则完全不传该参数**（保持原有行为）。
     //

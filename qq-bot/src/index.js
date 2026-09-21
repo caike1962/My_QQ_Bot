@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSync, closeSync, openSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSync, closeSync, openSync, renameSync, unlinkSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
@@ -10,6 +10,7 @@ import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
 import { buildDiagnostic } from "./diagnostics.js";
+import { renderReportHtml, reportFileName } from "./html-report.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -297,12 +298,19 @@ function lastExchange(records) {
   return said || replied || model ? { said, replied, model } : null;
 }
 
-function workspaceStatus() {
-  const p = config.claudeCwd ? `${config.claudeCwd}\\workspace` : null;
-  if (!p) return null;
+// 放产出文件的地方。优先 cwd 下的 workspace（模型自己也在这个目录里干活），
+// 不存在则退回 qq-bot 自带的那个——两条路径都在 workspaceStatus 与
+// 长回复落盘之间共用，所以抽成一个函数。
+function workspaceDir() {
+  const preferred = config.claudeCwd ? `${config.claudeCwd}\\workspace` : null;
   const fallback = "D:\\QQBOT\\qq-bot\\workspace";
-  const dir = existsSync(p) ? p : fallback;
-  if (!existsSync(dir)) return "不存在";
+  if (preferred && existsSync(preferred)) return preferred;
+  return existsSync(fallback) ? fallback : null;
+}
+
+function workspaceStatus() {
+  const dir = workspaceDir();
+  if (!dir) return "不存在";
   try {
     const names = readdirSync(dir);
     return names.length ? `${names.length} 个文件` : "空";
@@ -334,12 +342,131 @@ async function groupMemberCount(groupId) {
   }
 }
 
+// 超过 maxReplyChars 就截断并说明。这是"连文件都发不出"时的最后兜底。
+//
+// 截断用 session.js 的 truncate 而不是 Array.from(...).slice(...)：
+// 后者按**码点**切，而 emoji 常由多个码点组成（肤色修饰、ZWJ 序列、
+// 国旗），切在中间会留下半个字符——用户看到的就是个乱码方块。
+// 原来这里正是这么写的，属于实测过的显示缺陷。
+function truncatedReply(text, len) {
+  if (len <= config.maxReplyChars) return text;
+  return `${truncate(text, config.maxReplyChars)}\n\n（回复太长被截断，共 ${len} 字）`;
+}
+
 function fileSizeMb(path) {
   try {
     return statSync(path).size / 1048576;
   } catch {
     return null;
   }
+}
+
+// ———— 长回复走文件 ————
+
+// 把 HTML 写到 workspace 下。返回写好的绝对路径。
+//
+// 沿用 queue.js 的"先写临时文件再 rename"：本地直接覆盖时若进程被杀，
+// 磁盘上会留下半截文件，而用户拿到的正是那个路径。
+//
+// 重名加序号：文件名精确到分钟，同一分钟内连发两次长回复会撞名。
+// 不加序号的话后一份会静默覆盖前一份，用户点开看到的是上一份内容。
+function writeReportFile(html, at) {
+  const dir = workspaceDir();
+  if (!dir) throw new Error("找不到 workspace 目录，无法写报告文件");
+
+  const base = reportFileName(at);
+  let path = `${dir}\\${base}`;
+  let n = 1;
+  while (existsSync(path)) {
+    const dot = base.lastIndexOf(".");
+    path = `${dir}\\${base.slice(0, dot)}-${n++}${base.slice(dot)}`;
+  }
+
+  const tmp = `${path}.tmp`;
+  try {
+    writeFileSync(tmp, html, "utf8");
+    renameSync(tmp, path);
+  } catch (error) {
+    // 半截的临时文件不该留在用户的 workspace 里
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      /* 清理失败不影响主流程 */
+    }
+    throw error;
+  }
+  return path;
+}
+
+// 触发长回复走文件的阈值，以及是否启用。
+//
+// 只在**确实超过阈值**时返回 true。阈值以下照常发消息——那才是日常交互，
+// 弹个文件附件反而是打扰。
+function shouldSendAsFile(len) {
+  return config.reportFile && len > config.reportFileThreshold;
+}
+
+// 把长回复写成 HTML 文件发出去。
+//
+// 返回 true 表示文件已送达（调用方就不必再发正文了）；
+// false 表示没送成，调用方必须退回常规路径——**绝不能静默丢内容**。
+async function sendLongReplyAsFile({ event, key, text, len }) {
+  const at = Date.now();
+  let path;
+  try {
+    const html = renderReportHtml({ title: reportTitle(text), text, at });
+    path = writeReportFile(html, at);
+  } catch (error) {
+    log(`写报告文件失败，退回截断发送: ${error.message}`);
+    return false;
+  }
+
+  const isGroup = event.message_type === "group";
+  const fileName = path.slice(path.lastIndexOf("\\") + 1);
+  const params = isGroup
+    ? { group_id: Number(event.group_id), file: path, name: fileName }
+    : { user_id: Number(event.user_id), file: path, name: fileName };
+
+  try {
+    const sent = await client.action(isGroup ? "upload_group_file" : "upload_private_file", params);
+    if (sent?.status !== "ok") {
+      log(`上传报告文件失败，退回截断发送: ${JSON.stringify(sent)}`);
+      return false;
+    }
+  } catch (error) {
+    log(`上传报告文件异常，退回截断发送: ${error.message}`);
+    return false;
+  }
+
+  log(`长回复已作为文件发出 ${key}: ${fileName}（${len} 字）`);
+
+  // 配套的短消息。正文已经进文件了，这里只说明"东西在哪、有多长"——
+  // 没有它的话用户只看到一个文件，不知道是不是自己要的。
+  //
+  // 用 replyTo 而不是 handleMessage 里那个局部 reply()：这个函数在模块
+  // 作用域，拿不到那个闭包。replyTo 的行为一致（同样处理群聊 @）。
+  const notice = `内容较长（${len} 字），已整理成文件，用浏览器打开即可阅读。`;
+  try {
+    const r = await replyTo(event, notice);
+    if (r?.status !== "ok") log(`发送文件说明失败: ${JSON.stringify(r)}`);
+  } catch (error) {
+    log("发送文件说明失败: " + error.message);
+  }
+  return true;
+}
+
+// 报告的标题：取正文第一行（非空、不是编号开头）。
+//
+// 模型的长回复几乎都以一句话开头概括主题，拿它当标题最贴近读者预期；
+// 没有可用首行时退回一个中性标题，绝不因此让整条回复发不出去。
+function reportTitle(text) {
+  for (const line of String(text ?? "").split("\n")) {
+    const t = line.trim().replace(/^#+\s*/, "").replace(/\*\*/g, "");
+    if (!t) continue;
+    if (/^[一二三四五六七八九十百]+[、.．]/.test(t) || /^\d{1,3}[、.．)]/.test(t)) continue;
+    return truncate(t, 40);
+  }
+  return "报告";
 }
 
 // 渲染用的时间轴：会话文件里的记录时间戳是 ISO 字符串，比内存里记的
@@ -1186,17 +1313,24 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   await settle();
   log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${truncate(result.text, 80)}`);
 
-  // 超长回复不能整条发出去：QQ 侧会被静默拒收（retcode 会报 10062 之类的
-  // 参数错误），用户只看到一句回执、等不到结果。这里明确降级并告知。
+  // 长回复的处理分三级，按"能完整送达"优先：
   //
-  // 用 Array.from 按码点算长度：模型爱用 emoji，而 QQ 的长度限制也按字符算。
+  //   1. 超过 reportFileThreshold → 渲染成 HTML 文件发出去（内容完整）
+  //   2. 文件没发成 / 开关关掉  → 截断成 maxReplyChars 并说明（内容不全但送达）
+  //   3. 阈值以下              → 照常发消息
+  //
+  // 长度按**码点**算：模型爱用 emoji，而 QQ 的限制也按字符算。
   const len = Array.from(result.text).length;
-  const sent = await reply(
-    len > config.maxReplyChars
-      ? Array.from(result.text).slice(0, config.maxReplyChars).join("") +
-          `\n\n（回复太长被截断，共 ${len} 字）`
-      : result.text,
-  );
+
+  let sent;
+  if (shouldSendAsFile(len)) {
+    const ok = await sendLongReplyAsFile({ event, key, text: result.text, len });
+    // 文件失败时下面会走截断分支；成功则正文已经进文件了，不再重复发
+    sent = ok ? { status: "ok" } : await reply(truncatedReply(result.text, len));
+  } else {
+    sent = await reply(truncatedReply(result.text, len));
+  }
+
   if (sent?.status !== "ok") {
     log(`发送失败: ${JSON.stringify(sent)}`);
   } else {
@@ -1412,7 +1546,7 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
   //
   // 「继续」也不必在这里挡：handleRetry 早在 handleMessage 开头就把这种消息
   // 消费掉了，能走到这里的「继续」只可能是没有待重放条目的普通闲聊词。
-  if (!fromRetry && config.mergeInterrupt && !isDirectCommand(text)) {
+  if (!fromRetry && config.mergeInterrupt && !isDirectCommand(extractText(event.message))) {
     const exec = execs.get(key);
     if (exec && shouldInterrupt({
       enabled: config.mergeInterrupt,
