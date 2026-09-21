@@ -4,24 +4,34 @@ import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
 import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, senderLabel } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
-import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
-import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
+import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, setQueuePath, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
 import { formatHistory, historyBody } from "./history.js";
+import { loadRoles, addUser, removeUser, isUser, setRolesPath } from "./roles.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
 const roles = { isUser };
 const config = loadConfig();
 
+// 把 config 推导出的路径注入那两个模块。
+//
+// 它们各自有一份 `process.env.QQBOT_X || 写死默认值` 的兜底，那是给单测
+// 直接 import 时用的；生产路径必须以 config 为准，否则 QQ_DATA_DIR 只管到
+// 一半的文件（sessions/jobs 跟着走，queue/roles 留在原地）。
+setQueuePath(config.queuePath);
+setRolesPath(config.rolesPath);
+
 // 会话键统一在这里取，避免各处重复传配置。群聊是否按群共享见 config.groupSharedSession。
 const convKey = (event) => conversationKey(event, { groupShared: config.groupSharedSession });
 
-const SESSIONS_PATH = "D:\\QQBOT\\qq-bot\\sessions.json";
+// 所有落盘位置都从 config 取（见 config.js 的路径推导），
+// 这里不再写死任何目录——换机器只改 .env 的 QQ_DATA_DIR。
+const SESSIONS_PATH = config.sessionsPath;
 
 function loadSessions() {
   if (!existsSync(SESSIONS_PATH)) return new Map();
@@ -38,10 +48,15 @@ const sessions = loadSessions();
 // Claude Code 按工作目录划分项目，目录名是把 cwd 的非字母数字字符替换成 "-"
 const PROJECT_DIR = config.claudeCwd.replace(/[^A-Za-z0-9]/g, "-");
 
+// 会话文件的完整路径。包一层是为了把 projectsBase 固定传进去——
+// sessionPath 本身要 3 个参数，10 个调用点每次都写 baseDir 既啰嗦又容易漏，
+// 漏了就会静默去读另一个目录（表现为"会话丢了"而不是报错）。
+const sessPath = (sessionId) => sessionPath(PROJECT_DIR, sessionId, config.projectsBase);
+
 // 某会话当前对应的磁盘文件。null 表示还没有会话（第一条消息）。
 function sessionPathFor(key) {
   const sid = sessions.get(key);
-  return sid ? sessionPath(PROJECT_DIR, sid) : null;
+  return sid ? sessPath(sid) : null;
 }
 
 // 解析本条消息该用什么 sessionId resume，顺带做体积治理。
@@ -76,7 +91,7 @@ function resolveSession(key) {
 // （实测 input_tokens 从数万降到 5139），**磁盘文件不会变小**。
 // 注意 --autocompact 参数在无头 spawn 下实测不生效，别用它。
 function prepareSession(sessionId) {
-  const path = sessionPath(PROJECT_DIR, sessionId);
+  const path = sessPath(sessionId);
   const stripped = stripImages(path);
   if (stripped?.replaced) {
     log(
@@ -173,7 +188,7 @@ function humanSize(bytes) {
 // 内存态只能证明"进程在跑"，证明不了"它跑到哪了"。
 
 const BOOT_AT = Date.now();
-const QUEUE_PATH = process.env.QQBOT_QUEUE || "D:\\QQBOT\\qq-bot\\queue.json";
+const QUEUE_PATH = config.queuePath;
 
 // 本会话最后一次收到消息的时刻。容量上限防止群多时无限增长。
 const recent = new Map();
@@ -335,13 +350,12 @@ function lastExchange(records) {
 }
 
 // 放产出文件的地方。优先 cwd 下的 workspace（模型自己也在这个目录里干活），
-// 不存在则退回 qq-bot 自带的那个——两条路径都在 workspaceStatus 与
-// 长回复落盘之间共用，所以抽成一个函数。
+// 不存在则退回配置里的 workspaceDir（默认 ${QQ_DATA_DIR}\workspace）。
+// 两条路径在 workspaceStatus 与长回复落盘之间共用，所以抽成一个函数。
 function workspaceDir() {
   const preferred = config.claudeCwd ? `${config.claudeCwd}\\workspace` : null;
-  const fallback = "D:\\QQBOT\\qq-bot\\workspace";
   if (preferred && existsSync(preferred)) return preferred;
-  return existsSync(fallback) ? fallback : null;
+  return existsSync(config.workspaceDir) ? config.workspaceDir : null;
 }
 
 function workspaceStatus() {
@@ -547,7 +561,7 @@ async function collectDiagnostic(mergeWindowMs) {
   const sessionMeta = [];
   const activity = [];
   for (const [k, sid] of sessions) {
-    const path = sessionPath(PROJECT_DIR, sid);
+    const path = sessPath(sid);
     const tail = readTailRecords(path);
     const last = lastExchange(tail);
     const mem = recent.get(k);
@@ -586,7 +600,7 @@ async function collectDiagnostic(mergeWindowMs) {
   // 同名 const 会在初始化前引用它自己（TDZ 报错）。
   const execList = [...execs.entries()].map(([k, e]) => {
     const sid = e.sessionId || sessions.get(k) || null;
-    const path = sid ? sessionPath(PROJECT_DIR, sid) : null;
+    const path = sid ? sessPath(sid) : null;
     // 执行者的事件里没有原文时才回退到会话文件——而文件正被这个进程写着，
     // 读到的可能是半行，所以只取小窗口且失败就当没有。
     const last = !e.prompt && path ? lastExchange(readTailRecords(path, 16384, 20)) : null;
@@ -1203,7 +1217,7 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     const anchorSid = preset?.sessionId ?? sessions.get(key) ?? null;
     markBaseline(
       entryId,
-      anchorSid ? sessionLineCount(sessionPath(PROJECT_DIR, anchorSid)) : null,
+      anchorSid ? sessionLineCount(sessPath(anchorSid)) : null,
     );
   }
 
@@ -1218,7 +1232,7 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   const baseline = preset?.exec?.baseline ?? { lines: null };
   const wireBaseline = (sessionId) => {
     if (!sessionId) return;
-    const p = sessionPath(PROJECT_DIR, sessionId);
+    const p = sessPath(sessionId);
     const atSpawn = sessionLineCount(p);
     const poll = setInterval(() => {
       const now = sessionLineCount(p);
@@ -1747,7 +1761,7 @@ async function restoreQueue() {
     pendingRetry.set(e.key, e.event);
 
     const sid = sessions.get(e.key);
-    const last = sid ? lastRecordType(sessionPath(PROJECT_DIR, sid)) : null;
+    const last = sid ? lastRecordType(sessPath(sid)) : null;
     if (last === "cost-state") {
       log(`丢弃 ${e.key} 的误报条目：会话里这轮已完整跑完（末条=${last}）`);
       removePending(e.id);
@@ -1774,7 +1788,7 @@ async function restoreQueue() {
     // 而进程被强杀时，绝大多数任务其实已经在会话文件里跑完了（结果都发出去了）。
     // 无脑通知会让每次重启都误报一次，用户很快就不看了，真正的丢消息反被淹没。
     const sid = sessions.get(e.key);
-    const path = sid ? sessionPath(PROJECT_DIR, sid) : null;
+    const path = sid ? sessPath(sid) : null;
     const last = path ? lastRecordType(path) : null;
     // 末条是 cost-state = 完整跑完；或旧判据（末尾有正式回复文本）也认。
     // 两个判据都只看"有没有跑完"，任一成立即可静默清理。
@@ -1795,7 +1809,7 @@ async function restoreQueue() {
     // 压根不写会话，末尾永远不是 cost-state，所以上面那条静默清理覆盖不到它，
     // 每次重启都会被当成"没跑完"通知一遍。现在它们会被自动重放，不再唠叨。
     const anchor = sessions.get(e.key);
-    const anchorPath = anchor ? sessionPath(PROJECT_DIR, anchor) : null;
+    const anchorPath = anchor ? sessPath(anchor) : null;
     const decision = decideRecovery({
       baseline: e.baseline,
       currentLines: anchorPath ? sessionLineCount(anchorPath) : null,
@@ -1812,7 +1826,7 @@ async function restoreQueue() {
     // 断在哪一步：会话里悬空的工具调用。光说"没处理完"用户没法判断
     // 该不该回「继续」，列出最后几步它才有依据——尤其那种"改到一半停下"的任务。
     const detail = sid
-      ? pendingSummary(readSessionDelta(sessionPath(PROJECT_DIR, sid)))
+      ? pendingSummary(readSessionDelta(sessPath(sid)))
       : "";
 
     const isGroup = e.event.message_type === "group";

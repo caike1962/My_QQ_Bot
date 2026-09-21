@@ -37,6 +37,34 @@ function parseIdList(value) {
     .filter((n) => Number.isSafeInteger(n) && n > 0);
 }
 
+// 路径统一在这里推导，其它模块一律不再写死。
+//
+// 为什么要有这一步：原来 7 处路径各自散布在 config/index/queue/roles/session
+// 里，默认值全是这台机器的绝对路径。换一台机器就要改 7 个地方，漏一个的表现
+// 还是"悄悄用错了目录"而不是报错。
+//
+// 解析顺序（**显式配置优先于根目录推导**）：
+//   1. 该项自己的专用变量（如 QQ_QUEUE_PATH）——保留既有的覆盖能力，
+//      已经配过的部署不受影响
+//   2. 根目录 ${QQ_DATA_DIR}
+//   3. 内置默认
+// 先看专用变量再看根目录，是因为根目录是"一把大伞"，而专用变量是
+// 精确指令；让精确的赢才符合直觉。
+// 统一用反斜杠拼接 Windows 路径。
+//
+// 不这么做的话 QQ_DATA_DIR=E:/NewBot/data 会拼出 `E:/NewBot/data\sessions.json`
+// 这种混用分隔符的路径——Windows 能认，但日志里看着别扭，比对字符串时也容易出岔。
+// 正斜杠全部归一成反斜杠，末尾多余的斜杠去掉。
+function normalizeDir(dir) {
+  return String(dir).replace(/\//g, "\\").replace(/\\+$/, "");
+}
+
+function resolvePath(explicit, dataDir, relative, fallback) {
+  if (explicit) return explicit;
+  if (dataDir) return `${normalizeDir(dataDir)}\\${relative}`;
+  return fallback;
+}
+
 export function loadConfig() {
   const env = { ...parseEnvFile(CONFIG_PATH), ...process.env };
 
@@ -48,17 +76,33 @@ export function loadConfig() {
     throw new Error("缺少 QQ_CLAUDE_EXE（claude.exe 的完整路径）");
   }
 
+  // 数据目录：转移部署时改这一行就够，其余状态文件全部相对它推导。
+  const dataDir = env.QQ_DATA_DIR || "";
+  const DEFAULT = (relative) => `D:\\QQBOT\\qq-bot\\${relative}`;
+  const path = (explicit, relative) => resolvePath(explicit, dataDir, relative, DEFAULT(relative));
+
   return {
+    dataDir: normalizeDir(dataDir || "D:\\QQBOT\\qq-bot"),
+
     selfId,
     allowedSenders: parseIdList(env.QQ_ALLOWED_SENDERS),
     allowedGroups: parseIdList(env.QQ_ALLOWED_GROUPS),
     wsUrl: env.ONEBOT_WS_URL || "ws://127.0.0.1:3001",
     wsToken: env.ONEBOT_TOKEN || "",
 
+    // 状态文件。queuePath 与 rolesPath 也在这里定，
+    // 让"所有落盘位置"只有一个出处（那两个模块仍保留 setXxxPath 供测试注入）。
+    sessionsPath: path(env.QQ_SESSIONS_PATH, "sessions.json"),
+    queuePath: path(env.QQBOT_QUEUE, "queue.json"),
+    rolesPath: path(env.QQBOT_ROLES, "roles.json"),
+
     claudeExe: env.QQ_CLAUDE_EXE,
     claudeBaseUrl: env.QQ_CLAUDE_BASE_URL || "http://127.0.0.1:15721",
     claudeAuthToken: env.QQ_CLAUDE_AUTH_TOKEN || "PROXY_MANAGED",
     claudeHome: env.QQ_CLAUDE_HOME || "C:\\Users\\Administrator",
+    // 不跟随 QQ_DATA_DIR：它描述的是"本机 onebot-mcp 在哪个端口、用什么 token"，
+    // 属于部署资产而非机器人产生的数据。跟着数据目录跑的话，转移后它会指向
+    // 一个不存在的文件，而报错要到 spawn claude 那一刻才出现，很难定位。
     claudeMcpConfig: env.QQ_CLAUDE_MCP_CONFIG || "D:\\QQBOT\\qq-bot\\mcp-config.json",
     claudeCwd: env.QQ_CLAUDE_CWD || "C:\\Users\\Administrator",
 
@@ -220,6 +264,14 @@ export function loadConfig() {
 
     // 定时任务的配置文件。调度器每 20s 读一次，所以改完这个文件
     // **不需要重启**（与其它配置项不同）。
-    jobsPath: env.QQ_JOBS_PATH || "D:\\QQBOT\\qq-bot\\jobs.json",
+    jobsPath: path(env.QQ_JOBS_PATH, "jobs.json"),
+
+    // 长回复写的 HTML 报告、以及模型产出的其它文件都放这里。
+    // 优先 QQ_WORKSPACE_DIR，其次 ${QQ_DATA_DIR}\workspace。
+    workspaceDir: path(env.QQ_WORKSPACE_DIR, "workspace"),
+
+    // claude 的会话记录目录（--resume 读的就是这里）。
+    // 这个目录由 CLI 管理、位置固定，默认跟随 claudeHome。
+    projectsBase: env.QQ_PROJECTS_BASE || `${env.QQ_CLAUDE_HOME || "C:\\Users\\Administrator"}\\.claude\\projects`,
   };
 }
