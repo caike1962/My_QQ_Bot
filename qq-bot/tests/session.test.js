@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripImages, truncate } from "../src/session.js";
+import { stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary } from "../src/session.js";
 
 const BIG = "A".repeat(50_000); // 模拟 base64 图片
 
@@ -209,4 +209,302 @@ test("truncate: null/undefined 不抛错", () => {
 
 test("truncate: 恰好等于上限时不加省略号", () => {
   assert.equal(truncate("abcde", 5), "abcde");
+});
+
+// ---------- sessionCompleted ----------
+//
+// 判据：最后一个 assistant 记录里有没有正式回复文本。
+// 这决定重启时要不要告诉用户「回继续」——误报会让用户无视这句话。
+
+const asst = (blocks) => ({ type: "assistant", message: { content: blocks } });
+const text = (t) => ({ type: "text", text: t });
+const thinking = (t) => ({ type: "thinking", thinking: t });
+const toolUse = (name) => ({ type: "tool_use", id: "c1", name, input: {} });
+const toolResult = (id = "c1") => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id }] } });
+
+test("sessionCompleted: 末尾是正式回复 → 已完成", () => {
+  withTempFile([asst([toolUse("Read")]), toolResult(), asst([text("查好了")])], (f) => {
+    assert.equal(sessionCompleted(f), true);
+  });
+});
+
+test("sessionCompleted: 末尾停在工具调用 → 未完成", () => {
+  withTempFile([asst([text("我看看")]), asst([toolUse("Bash")]), toolResult()], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 工具调用没有结果（被强杀）→ 未完成", () => {
+  withTempFile([asst([toolUse("Bash")])], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 只有思考、没有正式回复 → 未完成", () => {
+  withTempFile([asst([thinking("让我想想")])], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 空文本块不算正式回复", () => {
+  withTempFile([asst([text("   ")])], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 回复后续的非 assistant 记录不影响判断", () => {
+  // 实测会话末尾是 cost-state / atis-latch 这类记录，不能因为它们在最后就判成未完成
+  withTempFile(
+    [asst([text("说完了")]), { type: "cost-state" }, { type: "atis-latch" }],
+    (f) => assert.equal(sessionCompleted(f), true),
+  );
+});
+
+test("sessionCompleted: 一条 assistant 记录都没有 → 未完成", () => {
+  withTempFile([{ type: "user", message: { content: "你好" } }], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 只看最后一条 assistant，中间的不算数", () => {
+  withTempFile([asst([text("上一轮说完了")]), toolResult(), asst([toolUse("Bash")])], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+test("sessionCompleted: 文件不存在返回 null（交调用方决定）", () => {
+  assert.equal(sessionCompleted("D:/definitely/not/here.jsonl"), null);
+});
+
+test("sessionCompleted: 损坏的行跳过，不影响正常判断", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-test-"));
+  const file = join(dir, "s.jsonl");
+  writeFileSync(file, [JSON.stringify(asst([text("好了")])), "{坏行", ""].join("\n"));
+  try {
+    assert.equal(sessionCompleted(file), true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sessionCompleted: 内容不是数组时不抛错", () => {
+  withTempFile([{ type: "assistant", message: { content: "纯字符串" } }], (f) => {
+    assert.equal(sessionCompleted(f), false);
+  });
+});
+
+// ---------- readSessionDelta ----------
+//
+// 事后查账：这轮都调了什么、断在哪一步。
+// 配对必须按 tool_use_id 精确匹配——实测 use 和 result 之间会夹其他记录。
+
+const use = (id, name, input = {}) => ({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input }] } });
+const resultOf = (id) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id }] } });
+
+test("readSessionDelta: 配对成功的调用标记为 done", () => {
+  withTempFile([use("c1", "Read", { file_path: "a.txt" }), resultOf("c1")], (f) => {
+    const d = readSessionDelta(f);
+    assert.equal(d.calls.length, 1);
+    assert.equal(d.calls[0].name, "Read");
+    assert.equal(d.calls[0].done, true);
+    assert.deepEqual(d.dangling, []);
+  });
+});
+
+test("readSessionDelta: 有调用没结果 → dangling（被强杀的信号）", () => {
+  withTempFile([use("c1", "Read"), resultOf("c1"), use("c2", "Bash")], (f) => {
+    const d = readSessionDelta(f);
+    assert.equal(d.calls.length, 2);
+    assert.equal(d.calls[1].done, false);
+    assert.deepEqual(d.dangling, ["c2"]);
+  });
+});
+
+test("readSessionDelta: use 和 result 中间夹其他记录也能配上（关键）", () => {
+  // 实测会话里两者之间夹着 last-prompt / mode / atis-latch
+  withTempFile(
+    [
+      use("c1", "Bash", { command: "npm install" }),
+      { type: "last-prompt" },
+      { type: "mode" },
+      { type: "atis-latch" },
+      resultOf("c1"),
+    ],
+    (f) => {
+      const d = readSessionDelta(f);
+      assert.equal(d.calls[0].done, true);
+      assert.deepEqual(d.dangling, []);
+    },
+  );
+});
+
+test("readSessionDelta: 游标之后才算增量，之前的调用不重复返回", () => {
+  withTempFile([use("c1", "Read"), resultOf("c1"), use("c2", "Bash"), resultOf("c2")], (f) => {
+    const first = readSessionDelta(f, 0);
+    assert.equal(first.calls.length, 2);
+
+    // 从第 2 行接着读：只剩 c2
+    const second = readSessionDelta(f, 2);
+    assert.equal(second.calls.length, 1);
+    assert.equal(second.calls[0].id, "c2");
+
+    // 返回的 lines 可以直接当下次游标用，再读一次应该没有新调用
+    const third = readSessionDelta(f, second.lines);
+    assert.equal(third.calls.length, 0);
+  });
+});
+
+test("readSessionDelta: 游标超过文件长度时夹到末尾，不越界报错", () => {
+  withTempFile([use("c1", "Read")], (f) => {
+    // 游标 9999 > 文件 1 行 → 夹到 1（末尾），没有新增可读，返回空而不是抛错
+    const d = readSessionDelta(f, 9999);
+    assert.deepEqual(d.calls, []);
+    assert.deepEqual(d.dangling, []);
+    assert.equal(d.lines, 1);
+  });
+});
+
+test("readSessionDelta: 空文件不抛错", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-test-"));
+  const file = join(dir, "empty.jsonl");
+  writeFileSync(file, "");
+  try {
+    const d = readSessionDelta(file);
+    assert.deepEqual(d.calls, []);
+    assert.deepEqual(d.dangling, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readSessionDelta: 工具输入超长时预览被截断，但 name/id 完整", () => {
+  const huge = { command: "x".repeat(5000) };
+  withTempFile([use("c1", "Bash", huge)], (f) => {
+    const d = readSessionDelta(f);
+    assert.ok(d.calls[0].preview.length < 200, "预览应被截断");
+    assert.equal(d.calls[0].name, "Bash");
+    assert.equal(d.calls[0].id, "c1");
+  });
+});
+
+test("readSessionDelta: 调用数超过 limit 时截断，但 dangling 仍完整", () => {
+  const recs = [];
+  for (let i = 0; i < 10; i++) recs.push(use(`c${i}`, "Read"), resultOf(`c${i}`));
+  recs.push(use("dangling1", "Bash")); // 最后的悬空调用
+  withTempFile(recs, (f) => {
+    const d = readSessionDelta(f, 0, { limit: 3 });
+    assert.equal(d.calls.length, 3, "展示被限制");
+    assert.equal(d.truncated, true);
+    assert.equal(d.calls[2].id, "dangling1", "保留的是最近的调用");
+    assert.deepEqual(d.dangling, ["dangling1"], "dangling 不受 limit 影响");
+  });
+});
+
+test("readSessionDelta: 没有触发截断时 truncated 为 false", () => {
+  withTempFile([use("c1", "Read")], (f) => {
+    assert.equal(readSessionDelta(f).truncated, false);
+  });
+});
+
+test("readSessionDelta: 文件不存在返回 null", () => {
+  assert.equal(readSessionDelta("D:/definitely/not/here.jsonl"), null);
+});
+
+test("readSessionDelta: 损坏的行跳过，不影响其他调用", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-test-"));
+  const file = join(dir, "s.jsonl");
+  writeFileSync(file, [JSON.stringify(use("c1", "Read")), "{坏行", JSON.stringify(resultOf("c1"))].join("\n"));
+  try {
+    const d = readSessionDelta(file);
+    assert.equal(d.calls.length, 1);
+    assert.equal(d.calls[0].done, true, "坏行不该阻断配对");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("readSessionDelta: 非数组 content 的记录被跳过", () => {
+  withTempFile(
+    [{ type: "user", message: { content: "纯字符串" } }, use("c1", "Read"), resultOf("c1")],
+    (f) => {
+      assert.equal(readSessionDelta(f).calls.length, 1);
+    },
+  );
+});
+
+test("readSessionDelta: 保持调用顺序", () => {
+  withTempFile([use("c1", "Read"), use("c2", "Bash"), use("c3", "Grep")], (f) => {
+    assert.deepEqual(readSessionDelta(f).calls.map((c) => c.name), ["Read", "Bash", "Grep"]);
+  });
+});
+
+test("readSessionDelta: 缺 id 的调用被忽略，不产生垃圾条目", () => {
+  withTempFile(
+    [{ type: "assistant", message: { content: [{ type: "tool_use", name: "Read" }] } }, use("c1", "Bash")],
+    (f) => {
+      const d = readSessionDelta(f);
+      assert.equal(d.calls.length, 1);
+      assert.equal(d.calls[0].name, "Bash");
+      assert.deepEqual(d.dangling, ["c1"]);
+    },
+  );
+});
+
+// ---------- pendingSummary ----------
+//
+// 只显示最后一个悬空工具之后的调用：更早的属于已经正常结束的轮次。
+
+test("pendingSummary: 有悬空时只列确定的步骤，悬空的不显示", () => {
+  // 悬空的 Bash 结果可能就写在后面那个 Read 的输出里，"✓ Read" 会是假象
+  const delta = {
+    calls: [
+      { id: "c1", name: "Read", done: true },
+      { id: "c2", name: "Bash", done: false },
+      { id: "c3", name: "Read", done: true },
+    ],
+    dangling: ["c2"],
+  };
+  const out = pendingSummary(delta);
+  assert.match(out, /已跑完的步骤/);
+  assert.match(out, /✓ Read/);
+  assert.ok(!out.includes("Bash"), "悬空的调用不该出现在已跑完的列表里");
+});
+
+test("pendingSummary: 最后一步悬空时明说没拿到结果", () => {
+  const delta = {
+    calls: [
+      { id: "c1", name: "Read", done: true },
+      { id: "c2", name: "Bash", done: false },
+    ],
+    dangling: ["c2"],
+  };
+  const out = pendingSummary(delta);
+  assert.match(out, /最后一步没有执行完/);
+  assert.ok(!out.includes("✓"), "没有可确认的步骤时不该列✓");
+});
+
+test("pendingSummary: 全部完成时列出步骤", () => {
+  const delta = {
+    calls: [
+      { id: "c1", name: "Read", done: true },
+      { id: "c2", name: "Bash", done: true },
+    ],
+    dangling: [],
+  };
+  const out = pendingSummary(delta);
+  assert.match(out, /已跑完的步骤/);
+  assert.match(out, /✓ Read/);
+  assert.match(out, /✓ Bash/);
+});
+
+test("pendingSummary: max 限制的是列出的步骤数", () => {
+  const calls = Array.from({ length: 10 }, (_, i) => ({ id: `c${i}`, name: "Read", done: true }));
+  const out = pendingSummary({ calls, dangling: [] }, 3);
+  assert.equal(out.split("\n").length, 5, "空行 1 + 标题 1 + 3 条");
+  assert.equal((out.match(/✓/g) || []).length, 3, "只列 3 步");
+});
+
+test("pendingSummary: 空或 null 返回空串，不抛错", () => {
+  assert.equal(pendingSummary(null), "");
+  assert.equal(pendingSummary({ calls: [], dangling: [] }), "");
 });
