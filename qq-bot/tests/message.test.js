@@ -2,11 +2,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   extractText,
+  extractAts,
   shouldHandle,
   stripLeadingMention,
   isBotMentioned,
   senderRole,
   parseRoleCommand,
+  resolveRoleTarget,
+  conversationKey,
+  senderLabel,
+  withSenderPrefix,
+  parseResetCommand,
 } from "../src/message.js";
 
 // ---------- extractText ----------
@@ -19,14 +25,31 @@ test("extractText: 剥离 CQ 码", () => {
   assert.equal(extractText("[CQ:face,id=123]你好[CQ:at,qq=1]"), "你好");
 });
 
+test("extractText: CQ 码两侧文本不被粘连（占位成空格）", () => {
+  // 「将 @钟总 添加为用户」去掉 at 后若直接拼接会变成「将添加为用户」，
+  // 指令就再也匹配不上了，所以 at 段必须留一个空格占位。
+  // 代价是可能出现连续空格，下游正则一律用 \s* 容忍。
+  assert.equal(extractText("[CQ:at,qq=1] 将 [CQ:at,qq=2] 添加为用户"), "将   添加为用户");
+  assert.match(extractText("将 [CQ:at,qq=1] 添加为用户"), /^将\s+添加为用户$/);
+  assert.equal(extractText("你好[CQ:at,qq=1]世界"), "你好 世界");
+});
+
 test("extractText: 纯 CQ 码剥完为空", () => {
   assert.equal(extractText("[CQ:image,file=a.jpg]"), "");
 });
 
-test("extractText: 数组取 text 段拼接", () => {
+test("extractText: 数组取 text 段拼接，at 段占位成空格", () => {
   const msg = [
     { type: "text", data: { text: "你好" } },
     { type: "image", data: { file: "a.jpg" } },
+    { type: "text", data: { text: "世界" } },
+  ];
+  assert.equal(extractText(msg), "你好 世界");
+});
+
+test("extractText: 数组里连续 text 段不会互相插入空格", () => {
+  const msg = [
+    { type: "text", data: { text: "你好" } },
     { type: "text", data: { text: "世界" } },
   ];
   assert.equal(extractText(msg), "你好世界");
@@ -325,26 +348,287 @@ test("shouldHandle: 陌生人（非 admin 非 user）在群里 @ 也拒绝", () 
 // ---------- parseRoleCommand ----------
 
 test("parseRoleCommand: 添加用户", () => {
-  assert.deepEqual(parseRoleCommand("将 12345678 添加为用户"), { action: "add", qq: 12345678 });
+  assert.deepEqual(parseRoleCommand("将 12345678 添加为用户"), {
+    action: "add",
+    qq: 12345678,
+    name: null,
+  });
 });
 
 test("parseRoleCommand: 添加用户容忍多余空白", () => {
   assert.deepEqual(parseRoleCommand("  将  12345678 添加为 用户  "), {
     action: "add",
     qq: 12345678,
+    name: null,
   });
 });
 
 test("parseRoleCommand: 全角空格也能解析", () => {
-  assert.deepEqual(parseRoleCommand("将　12345678　添加为用户"), { action: "add", qq: 12345678 });
+  assert.deepEqual(parseRoleCommand("将　12345678　添加为用户"), {
+    action: "add",
+    qq: 12345678,
+    name: null,
+  });
 });
 
 test("parseRoleCommand: 移出用户", () => {
-  assert.deepEqual(parseRoleCommand("将 12345678 移出用户"), { action: "remove", qq: 12345678 });
+  assert.deepEqual(parseRoleCommand("将 12345678 移出用户"), {
+    action: "remove",
+    qq: 12345678,
+    name: null,
+  });
+});
+
+// 名字形式（群里 @ 某人后 QQ 转成纯文本，号码消失）。
+// 必须带 @ 前缀——这是防止把「将 abc 添加为用户」这类被截断的句子
+// 误当成指令的唯一信号。
+
+test("parseRoleCommand: @名字 形式返回 name 待解析", () => {
+  assert.deepEqual(parseRoleCommand("将 @钟总 添加为用户"), {
+    action: "add",
+    qq: null,
+    name: "钟总",
+  });
+});
+
+test("parseRoleCommand: @名字 无空格也能解析", () => {
+  assert.deepEqual(parseRoleCommand("将@钟总添加为用户"), {
+    action: "add",
+    qq: null,
+    name: "钟总",
+  });
+});
+
+test("parseRoleCommand: @名字 移出用户", () => {
+  assert.deepEqual(parseRoleCommand("将 @钟总 移出用户"), {
+    action: "remove",
+    qq: null,
+    name: "钟总",
+  });
+});
+
+test("parseRoleCommand: 裸名字不匹配（防止把截断句当成指令）", () => {
+  for (const bad of [
+    "将钟总添加为用户",
+    "将 abc 添加为用户",
+    "将 添加为用户",
+    "将 @ 添加为用户",
+  ]) {
+    assert.equal(parseRoleCommand(bad), null, `输入 "${bad}" 应返回 null`);
+  }
 });
 
 test("parseRoleCommand: 无效输入返回 null", () => {
   for (const bad of ["", "把 123 添加为用户", "将 abc 添加为用户", "将 123 添加为管理员", "添加 12345678 为用户", "你好"]) {
     assert.equal(parseRoleCommand(bad), null, `输入 "${bad}" 应返回 null`);
   }
+});
+
+// ---------- resolveRoleTarget ----------
+//
+// 覆盖真实的四种消息形态。A/C 两种「文本被 at 段切开」的情况最关键：
+// 文本残缺成「将   添加为用户」，任何名字正则都匹配不了，但目标号码
+// 就藏在 at 段里，必须靠它救回来。
+
+const SELF = 3126747682;
+const resolve = (message, text, ats) =>
+  resolveRoleTarget({ text, mentionAts: ats ?? extractAts(message), selfId: SELF });
+
+function pipeline(message) {
+  const stripped = stripLeadingMention(extractText(message), ["deepseek-v8"]);
+  return { text: stripped, ats: extractAts(message) };
+}
+
+test("resolveRoleTarget: 数组 @机器人 将 @钟总 —— 从 at 段取号", () => {
+  const msg = [
+    { type: "at", data: { qq: 3126747682 } },
+    { type: "text", data: { text: " 将 " } },
+    { type: "at", data: { qq: 2998981505 } },
+    { type: "text", data: { text: " 添加为用户" } },
+  ];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: 2998981505, name: null });
+});
+
+test("resolveRoleTarget: 字符串 CQ 码形式同样能从 at 段取号", () => {
+  const msg = "[CQ:at,qq=3126747682] 将 [CQ:at,qq=2998981505] 添加为用户";
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: 2998981505, name: null });
+});
+
+test("resolveRoleTarget: at 段只有机器人时不能把机器人当目标", () => {
+  const msg = [
+    { type: "at", data: { qq: 3126747682 } },
+    { type: "text", data: { text: " 将 添加为用户" } },
+  ];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: null, name: null });
+});
+
+test("resolveRoleTarget: 纯文本 @名字 退回名字解析", () => {
+  const msg = [{ type: "text", data: { text: "@deepseek-v8 将 @钟总 添加为用户" } }];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: null, name: "钟总" });
+});
+
+test("resolveRoleTarget: 直接写号码优先于 at 段", () => {
+  const msg = [
+    { type: "at", data: { qq: 3126747682 } },
+    { type: "text", data: { text: " 将 2998981505 添加为用户" } },
+  ];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "add", qq: 2998981505, name: null });
+});
+
+test("resolveRoleTarget: 移出用户同样支持 at 段取号", () => {
+  const msg = [
+    { type: "at", data: { qq: 3126747682 } },
+    { type: "text", data: { text: " 将 " } },
+    { type: "at", data: { qq: 2998981505 } },
+    { type: "text", data: { text: " 移出用户" } },
+  ];
+  const { text, ats } = pipeline(msg);
+  assert.deepEqual(resolve(msg, text, ats), { action: "remove", qq: 2998981505, name: null });
+});
+
+test("resolveRoleTarget: 非指令文本返回 null", () => {
+  for (const bad of ["你好", "把 123 添加为用户", "你好 将 123 添加为用户", "将 123 添加为管理员"]) {
+    assert.equal(resolveRoleTarget({ text: bad, mentionAts: [], selfId: SELF }), null, `"${bad}"`);
+  }
+});
+
+test("resolveRoleTarget: 指令残缺但意图成立时返回空目标（交给模型澄清）", () => {
+  const r = resolveRoleTarget({ text: "将  添加为用户", mentionAts: [], selfId: SELF });
+  assert.deepEqual(r, { action: "add", qq: null, name: null });
+});
+
+// ---------- conversationKey ----------
+
+test("conversationKey: 群聊默认按群共享（同群不同人同一条会话）", () => {
+  const a = { message_type: "group", group_id: 111, user_id: 1 };
+  const b = { message_type: "group", group_id: 111, user_id: 2 };
+  assert.equal(conversationKey(a), "group:111");
+  assert.equal(conversationKey(b), "group:111");
+  assert.equal(conversationKey(a), conversationKey(b));
+});
+
+test("conversationKey: 不同群互相隔离", () => {
+  const a = { message_type: "group", group_id: 111, user_id: 1 };
+  const b = { message_type: "group", group_id: 222, user_id: 1 };
+  assert.notEqual(conversationKey(a), conversationKey(b));
+});
+
+test("conversationKey: 关闭共享后退回按群+人隔离", () => {
+  const a = { message_type: "group", group_id: 111, user_id: 1 };
+  const b = { message_type: "group", group_id: 111, user_id: 2 };
+  assert.equal(conversationKey(a, { groupShared: false }), "111:1");
+  assert.notEqual(
+    conversationKey(a, { groupShared: false }),
+    conversationKey(b, { groupShared: false }),
+  );
+});
+
+test("conversationKey: 私聊始终按人隔离，不受共享开关影响", () => {
+  const p = { message_type: "private", user_id: 42 };
+  assert.equal(conversationKey(p), "private:42");
+  assert.equal(conversationKey(p, { groupShared: false }), "private:42");
+});
+
+// ---------- senderLabel / withSenderPrefix ----------
+
+test("senderLabel: 优先用群名片", () => {
+  const e = { user_id: 12345, sender: { card: "钟总", nickname: "zhong" } };
+  assert.equal(senderLabel(e), "[钟总(12345)]");
+});
+
+test("senderLabel: 无群名片回退昵称", () => {
+  const e = { user_id: 12345, sender: { card: "", nickname: "钟总" } };
+  assert.equal(senderLabel(e), "[钟总(12345)]");
+});
+
+test("senderLabel: 昵称缺失用占位名，号码仍在", () => {
+  assert.equal(senderLabel({ user_id: 12345 }), "[群成员(12345)]");
+});
+
+test("senderLabel: 昵称里的换行和方括号被清掉（防止伪造第二个标签）", () => {
+  const e = { user_id: 1, sender: { nickname: "a]\n[b" } };
+  assert.equal(senderLabel(e), "[a b(1)]");
+});
+
+test("senderLabel: 昵称过长被截断", () => {
+  const e = { user_id: 1, sender: { nickname: "x".repeat(50) } };
+  const label = senderLabel(e);
+  assert.match(label, /^\[x{24}\(1\)\]$/);
+});
+
+test("senderLabel: user_id 非法返回 null", () => {
+  for (const bad of [null, undefined, {}, { user_id: 0 }, { user_id: "abc" }]) {
+    assert.equal(senderLabel(bad), null, `输入 ${JSON.stringify(bad)}`);
+  }
+});
+
+test("withSenderPrefix: 文本前加上标签", () => {
+  const e = { user_id: 12345, sender: { nickname: "钟总" } };
+  assert.equal(withSenderPrefix("帮我看下", e), "[钟总(12345)] 帮我看下");
+});
+
+test("withSenderPrefix: 拿不到标签时原样返回", () => {
+  assert.equal(withSenderPrefix("帮我看下", { user_id: 0 }), "帮我看下");
+});
+
+// ---------- parseResetCommand ----------
+
+test("parseResetCommand: 三种写法都识别，容忍空白", () => {
+  for (const s of ["/reset", " /reset ", "/清空", "/重置", "\t/reset\n"]) {
+    assert.equal(parseResetCommand(s), true, `"${s}" 应识别`);
+  }
+});
+
+test("parseResetCommand: 带参数的/普通文本不识别", () => {
+  for (const bad of ["/reset now", "reset", "/清空会话", "帮我 /reset", "", null, undefined]) {
+    assert.equal(parseResetCommand(bad), false, `"${bad}" 不应识别`);
+  }
+});
+
+// ---------- extractAts ----------
+
+test("extractAts: 数组取所有 at 段的 qq", () => {
+  const msg = [
+    { type: "at", data: { qq: 2998981505 } },
+    { type: "text", data: { text: " 你好" } },
+    { type: "at", data: { qq: "1765116032" } },
+  ];
+  assert.deepEqual(extractAts(msg), [
+    { qq: 2998981505, name: null },
+    { qq: "1765116032", name: null },
+  ]);
+});
+
+test("extractAts: 段里带 name 时取 name", () => {
+  const msg = [{ type: "at", data: { qq: 2998981505, name: "钟总" } }];
+  assert.deepEqual(extractAts(msg), [{ qq: 2998981505, name: "钟总" }]);
+});
+
+test("extractAts: 字符串形式解析 CQ 码", () => {
+  assert.deepEqual(extractAts("[CQ:at,qq=2998981505] 你好"), [
+    { qq: "2998981505", name: null },
+  ]);
+});
+
+test("extractAts: 字符串 CQ 码带 name", () => {
+  assert.deepEqual(extractAts("[CQ:at,qq=2998981505,name=钟总] 你好"), [
+    { qq: "2998981505", name: "钟总" },
+  ]);
+});
+
+test("extractAts: 无 at 段返回空数组", () => {
+  assert.deepEqual(extractAts([{ type: "text", data: { text: "你好" } }]), []);
+  assert.deepEqual(extractAts("你好"), []);
+});
+
+test("extractAts: 异常输入返回空数组不抛错", () => {
+  for (const bad of [null, undefined, 42, {}, true]) {
+    assert.deepEqual(extractAts(bad), [], `输入 ${JSON.stringify(bad)}`);
+  }
+  assert.deepEqual(extractAts([null, { type: "at" }, { type: "at", data: {} }]), []);
 });

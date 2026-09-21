@@ -2,13 +2,18 @@ import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
-import { extractText, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, parseRoleCommand } from "./message.js";
-import { sessionPath, stripImages } from "./session.js";
+import { extractText, extractAts, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand } from "./message.js";
+import { sessionPath, stripImages, truncate } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
+import { markQueued, markRunning, removePending, loadEntries, setQueueLogger } from "./queue.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
+setQueueLogger((msg) => log(msg));
 const roles = { isUser };
 const config = loadConfig();
+
+// 会话键统一在这里取，避免各处重复传配置。群聊是否按群共享见 config.groupSharedSession。
+const convKey = (event) => conversationKey(event, { groupShared: config.groupSharedSession });
 
 const SESSIONS_PATH = "D:\\QQBOT\\qq-bot\\sessions.json";
 
@@ -80,6 +85,63 @@ function saveSessions() {
 const queues = new Map();
 let client;
 
+// 重启时留下的、状态未知的消息（key → 原始事件）。
+//
+// 为什么不自动重放：这些条目被标成 "running"，意味着 claude 可能已经执行了一部分
+// ——这台机器上真的会卸载软件、踢人，猜错代价太高。改为让用户回「继续」自行决定。
+const pendingRetry = new Map();
+
+// 「继续」= 重放该会话上一条未完成的消息。
+//
+// 只在**恰好有**待重放条目时拦截。正常开机（干净启动、无 pending）时
+// 「继续」就是个普通闲聊词，照常走模型，不会被这里吃掉。
+const RETRY_WORDS = new Set(["继续"]);
+
+async function handleRetry(event, text) {
+  const key = convKey(event);
+  const pending = pendingRetry.get(key);
+  if (!pending) return false;
+
+  // 用户可能发「继续」之外的话，那就先消费掉 pending，让消息正常走
+  if (!RETRY_WORDS.has(text.trim())) return false;
+
+  const isGroup = event.message_type === "group";
+  const userId = Number(event.user_id);
+  const reply = async (message) =>
+    isGroup
+      ? client.action("send_group_msg", {
+          group_id: Number(event.group_id),
+          message: config.replyToSender ? `[CQ:at,qq=${userId}] ${message}` : message,
+        })
+      : client.action("send_private_msg", { user_id: userId, message });
+
+  pendingRetry.delete(key);
+
+  // 纵深防御：能进 pendingRetry 的条目其实都已通过 handleMessage 的长度检查
+  // （markRunning 在长度检查**之后**才调用，超长消息根本走不到那一步）。
+  // 这里再查一次是为了防止将来有人调整检查顺序时悄声失效。
+  let pendingText = extractText(pending.message);
+  if (isGroup) pendingText = stripLeadingMention(pendingText, config.groupMentionNames);
+  if (pendingText.length > config.maxPromptChars) {
+    log(`待重放消息超长（${pendingText.length} 字），不再重放`);
+    await reply(
+      `刚才那条没处理完的消息太长了（${pendingText.length} 字），超过了 ${config.maxPromptChars} 字的限制，没法重放。`,
+    ).catch((e) => log("发送超长提示失败: " + e.message));
+    return true;
+  }
+
+  log(`收到「继续」，重放 ${key} 的未完成消息`);
+
+  try {
+    await reply("好，重新执行刚才那条。");
+  } catch (error) {
+    log("发送「继续」确认失败: " + error.message);
+  }
+
+  enqueue(pending, { fromRetry: true });
+  return true;
+}
+
 function onEvent(event) {
   if (shouldHandle(event, config, roles)) {
     enqueue(event);
@@ -104,17 +166,62 @@ function onEvent(event) {
   }
 }
 
+// 把名字解析成 QQ 号——**兜底路径**，只在 at 段也没给出号码时才走到这里
+// （QQ 把 @ 转成纯文本时号码会彻底消失，只剩昵称）。
+//
+// 返回 undefined 表示"没解析出来"——调用方据此静默退回模型路径，
+// 不要在这里替用户做决定（加错人比不加人严重得多）。
+async function resolveMentionedQq({ name, groupId }) {
+  const target = String(name || "").trim();
+  if (!target) return undefined;
+  if (!groupId) {
+    log(`无法解析「${target}」：只在群聊里能按昵称查人（私聊没有成员列表）`);
+    return undefined;
+  }
+
+  let members;
+  try {
+    const res = await client.action("get_group_member_list", { group_id: groupId });
+    members = res?.data;
+  } catch (error) {
+    log(`查询群成员列表失败: ${error.message}`);
+    return undefined;
+  }
+  if (!Array.isArray(members)) {
+    log(`群成员列表返回异常，无法解析「${target}」`);
+    return undefined;
+  }
+
+  const want = target.toLowerCase();
+  const hits = members.filter((m) =>
+    [m?.card, m?.nickname].some((v) => typeof v === "string" && v.toLowerCase() === want),
+  );
+  if (!hits.length) {
+    log(`群成员里没有叫「${target}」的人`);
+    return undefined;
+  }
+  if (hits.length > 1) {
+    log(`群成员里有 ${hits.length} 个叫「${target}」的，无法确定是哪一个`);
+    return undefined;
+  }
+  return Number(hits[0].user_id);
+}
+
 // 精确命令的直连执行通道。返回 true 表示本条消息已被消费，不应再送给模型。
 //
 // 这条路径不经过模型，直接调 OneBot API。保留它的理由：
-async function handleMessage(event) {
+async function handleMessage(event, entryId = null) {
   const userId = Number(event.user_id);
   const isGroup = event.message_type === "group";
   const groupId = isGroup ? Number(event.group_id) : null;
-  const key = conversationKey(event);
+  const key = convKey(event);
 
   let text = extractText(event.message);
   if (isGroup) text = stripLeadingMention(text, config.groupMentionNames);
+
+  // @ 段必须从**原始消息**里取：QQ 转纯文本时昵称只存在于 at 段里，
+  // 上面的 extractText + stripLeadingMention 已经把它清掉了。
+  const ats = extractAts(event.message);
 
   // 回复目标：群里回群，私聊回个人
   // 注意：这里走的是原生 OneBot API 名，不是 MCP 工具名。
@@ -128,8 +235,23 @@ async function handleMessage(event) {
         })
       : client.action("send_private_msg", { user_id: userId, message });
 
+  // 提前返回也必须摘除条目，否则它会永久残留：
+  // 每次重启都被当作 queued 重放一遍（角色指令会被重复执行），
+  // 且日积月累撑到体积上限，导致整个队列被丢弃、保护彻底失效。
+  // 摘除是幂等的，正常路径结尾再摘一次无害。
+  const done = () => {
+    if (entryId) removePending(entryId);
+  };
+
   if (!text) {
     log(`来自 ${key} 的消息无文本内容，跳过`);
+    done();
+    return;
+  }
+
+  // 「继续」：重放该会话上一条未完成的消息（重启前被强杀的那条）
+  if (await handleRetry(event, text)) {
+    done();
     return;
   }
 
@@ -137,42 +259,89 @@ async function handleMessage(event) {
   // 加人/移除这种权限操作由代码确定性执行，不能交给模型转述
   // （该模型在工具被拒时会"编造"执行结果，例如假装已写入名单）。
   const role = senderRole(userId, config, roles);
-  const roleCmd = parseRoleCommand(text);
+  const roleCmd = resolveRoleTarget({
+    text,
+    mentionAts: ats,
+    selfId: config.selfId,
+  });
   if (roleCmd) {
     if (role !== "admin") {
       await reply("你没有权限管理用户名单。").catch((e) => log("发送权限提示失败: " + e.message));
+      done();
       return;
     }
-    const qq = roleCmd.qq;
-    if (qq === userId || qq === config.selfId) {
-      await reply(`${qq} 不需要也不应该进入用户名单。`).catch((e) => log("发送提示失败: " + e.message));
-      return;
-    }
-    try {
-      if (roleCmd.action === "add") {
-        const added = addUser(qq);
-        await reply(
-          added
-            ? `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。`
-            : `${qq} 已在用户名单中。`,
-        );
-      } else {
-        const removed = removeUser(qq);
-        await reply(removed ? `已将 ${qq} 移出用户名单。` : `${qq} 不在用户名单中。`);
+    const qq = roleCmd.qq ?? (await resolveMentionedQq({ name: roleCmd.name, groupId }));
+    if (!qq) {
+      log(`无法解析「${roleCmd.name}」的 QQ 号，转交模型处理`);
+    } else {
+      if (qq === userId || qq === config.selfId) {
+        await reply(`${qq} 不需要也不应该进入用户名单。`).catch((e) => log("发送提示失败: " + e.message));
+        done();
+        return;
       }
-    } catch (error) {
-      log(`修改用户名单失败: ${error.message}`);
-      await reply(`修改用户名单失败：${String(error.message).slice(0, 120)}`);
+      try {
+        if (roleCmd.action === "add") {
+          const added = addUser(qq);
+          await reply(
+            added
+              ? `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。`
+              : `${qq} 已在用户名单中。`,
+          );
+        } else {
+          const removed = removeUser(qq);
+          await reply(removed ? `已将 ${qq} 移出用户名单。` : `${qq} 不在用户名单中。`);
+        }
+      } catch (error) {
+        log(`修改用户名单失败: ${error.message}`);
+        await reply(`修改用户名单失败：${String(error.message).slice(0, 120)}`);
+      }
+      done();
+      return;
     }
+  }
+
+  // /reset：清空当前会话上下文（仅 admin）。
+  //
+  // 走代码路径而不是模型路径：共享会话后上下文是全群可见的，重置必须
+  // 确定性执行——交给模型转述，它可能只是回一句"已清空"而实际什么都没做。
+  //
+  // 只删除本地的会话映射，不动会话文件（文件里还有历史，留着不影响：
+  // 下一次消息不再 --resume，就是全新上下文）。不删除映射的话，
+  // 压缩队列等后台任务仍按旧 sessionId 操作，删映射是最小且可逆的做法。
+  if (parseResetCommand(text)) {
+    if (role !== "admin") {
+      await reply("只有管理员能重置会话上下文。").catch((e) => log("发送权限提示失败: " + e.message));
+      done();
+      return;
+    }
+    const had = sessions.delete(key);
+    if (had) saveSessions();
+    log(`重置会话上下文 ${key}（${had ? "已清除" : "本就没有"}）`);
+    await reply(
+      had
+        ? isGroup
+          ? "已清空本群的对话上下文，下一条消息从空白开始。"
+          : "已清空对话上下文，下一条消息从空白开始。"
+        : "当前没有进行中的会话，本来就是空的。",
+    ).catch((e) => log("发送重置提示失败: " + e.message));
+    done();
     return;
   }
 
   if (text.length > config.maxPromptChars) {
     await reply(`消息太长了（${text.length} 字），请控制在 ${config.maxPromptChars} 字以内。`);
+    done();
     return;
   }
 
-  log(`收到 ${key}: ${text.slice(0, 80)}`);
+  // 共享会话里模型只能靠前缀知道是谁在说话。只在群聊加——私聊会话只有一个人。
+  const prompt = isGroup && config.senderPrefix ? withSenderPrefix(text, event) : text;
+
+  log(`收到 ${key}: ${truncate(prompt, 80)}`);
+
+  // 标记为执行中。此后进程若被强杀，这条会被启动恢复记入 pendingRetry
+  // （不自动重放——可能已执行了一部分，交给用户回「继续」决定）。
+  if (entryId) markRunning(entryId);
 
   const invoke = (sessionId) =>
     runClaude({
@@ -182,12 +351,13 @@ async function handleMessage(event) {
       homeDir: config.claudeHome,
       cwd: config.claudeCwd,
       mcpConfigPath: config.claudeMcpConfig,
-      prompt: text,
+      prompt,
       sessionId,
       allowedTools: config.allowedTools,
       timeoutMs: config.timeoutMs,
       mcpTimeoutMs: config.mcpTimeoutMs,
       role,
+      model: config.claudeModel,
     });
 
   let result;
@@ -232,6 +402,7 @@ async function handleMessage(event) {
         await reply(`抱歉，处理出错了：${detail.slice(0, 120)}`).catch((e) =>
           log("发送错误提示失败: " + e.message),
         );
+        done();
         return;
       }
     }
@@ -242,8 +413,13 @@ async function handleMessage(event) {
     saveSessions();
   }
 
+  // 处理完成，从磁盘队列摘除。放在发送**之前**是有意的：
+  // 若发送成功但摘除失败，重启后这条仍是 running → 进 pendingRetry，
+  // 最多让用户回一次「继续」重放；反过来则会重复发送。
+  done();
+
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-  log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${result.text.slice(0, 80)}`);
+  log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${truncate(result.text, 80)}`);
 
   const sent = await reply(result.text);
   if (sent?.status !== "ok") {
@@ -271,6 +447,7 @@ function runCompaction(key, sessionId) {
     cwd: config.claudeCwd,
     sessionId,
     timeoutMs: config.compactTimeoutMs,
+    model: config.claudeModel,
   })
     .then((r) => {
       log(
@@ -283,11 +460,19 @@ function runCompaction(key, sessionId) {
     });
 }
 
-function enqueue(event) {
-  const key = conversationKey(event);
-  const prev = queues.get(key) || Promise.resolve();
-  const next = prev
-    .then(() => handleMessage(event))
+function enqueue(event, { fromRetry = false } = {}) {
+  const key = convKey(event);
+
+  // 入队即落盘：pm2 用 taskkill /F 强杀（不发信号），这一步是「消息已收到」
+  // 唯一的持久化机会。重放不计入队列，否则「继续」会让条目反复堆积。
+  //
+  // 必须按**条目**（id）而非按 key 追踪：同一会话可能积压多条（用户连发），
+  // 同一时刻只有队首在执行；按 key 标记会把整批都标成执行中，
+  // 让从未执行过的后续消息在恢复时被误判为「状态未知」而不能自动重放。
+  const entryId = fromRetry ? null : markQueued(key, event);
+
+  const prev = queues.get(key) || Promise.resolve();  const next = prev
+    .then(() => handleMessage(event, entryId))
     .catch((error) => log(`处理异常: ${error.stack || error.message}`));
   queues.set(key, next);
   next.finally(() => {
@@ -306,10 +491,59 @@ log(
   `启动: bot=${config.selfId} 角色管理=开` +
     ` admin=[${config.allowedSenders.join(",") || "无(全部按 admin)"}]` +
     ` user=[${loadRoles().users.join(",") || "无"}]` +
-    ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}])` : ""} ` +
+    ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}], 会话=${config.groupSharedSession ? "按群共享" : "按群+人隔离"})` : ""} ` +
     `工具数=${config.allowedTools.split(",").length} 超时=${config.timeoutMs / 1000}s`,
 );
+
+// 恢复上次进程留下的队列。
+//
+//   queued  → 进程在标 running 之前就死了，确定没执行过，直接重放
+//   running → 可能已执行一部分，不自动重放；告知用户可回「继续」自行决定
+//
+// 通知回复要在 ws 连上之后才能发，所以这里先收集，等连接就绪再发。
+// 等 ws 连上再发。启动几毫秒内连接未必就绪，而恢复通知只在启动时发一次，
+// 错过了就永远不发了。
+async function sendWhenConnected(action, params, tries = 20, gapMs = 250) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await client.action(action, params);
+    } catch (error) {
+      if (!/未连接/.test(error.message) || i === tries - 1) throw error;
+      await new Promise((r) => setTimeout(r, gapMs));
+    }
+  }
+}
+
+async function restoreQueue() {
+  const entries = loadEntries();
+  if (!entries.length) return;
+
+  const queued = entries.filter((e) => e.status === "queued");
+  const interrupted = entries.filter((e) => e.status !== "queued");
+
+  for (const e of queued) {
+    log(`恢复未处理消息 ${e.key}: ${truncate(extractText(e.event.message), 60)}`);
+    enqueue(e.event, { fromRetry: true });
+  }
+
+  for (const e of interrupted) {
+    pendingRetry.set(e.key, e.event);
+    const isGroup = e.event.message_type === "group";
+    const params = isGroup
+      ? { group_id: Number(e.event.group_id), message: "刚才那条消息没处理完（我重启过），回「继续」我就重新执行它。" }
+      : { user_id: Number(e.event.user_id), message: "刚才那条消息没处理完（我重启过），回「继续」我就重新执行它。" };
+    try {
+      const sent = await sendWhenConnected(isGroup ? "send_group_msg" : "send_private_msg", params);
+      if (sent?.status !== "ok") log(`发送恢复提示失败: ${JSON.stringify(sent)}`);
+      else log(`已告知 ${e.key} 可回「继续」重放`);
+    } catch (error) {
+      log(`发送恢复提示失败: ${error.message}`);
+    }
+  }
+}
+
 client.connect();
+restoreQueue().catch((error) => log(`队列恢复失败: ${error.message}`));
 
 function shutdown(signal) {
   log(`收到 ${signal}，退出中`);

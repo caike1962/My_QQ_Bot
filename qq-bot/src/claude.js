@@ -1,6 +1,40 @@
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 
+// 强杀整个进程树。
+//
+// 为什么不能用 child.kill()：Windows 上 claude.exe 是控制台程序，
+// Node 的 kill 信号投递不可靠；而它派生的子进程不会跟着退出，
+// 残留进程会一直持有 stdout 管道 —— 于是 'close' 事件**永不触发**，
+// 超时分支就永远挂在那里（实测遇到过，见 QQ_TIMEOUT_MS 的 300s 卡死）。
+// taskkill /T /F 是唯一能连子进程一起收掉的办法（pm2 自己也是这么干的）。
+//
+// 注意 stdio 用了 ignore，不依赖管道关闭；'close' 在进程真正退出后才触发。
+function killTree(child) {
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === "win32") {
+    try {
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        /* 已退出 */
+      }
+    }
+    return;
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    /* 已退出 */
+  }
+}
+
 export class ClaudeError extends Error {
   constructor(message, { code, stderr, cost, raw } = {}) {
     super(message);
@@ -30,7 +64,7 @@ export const FORBIDDEN_ARGS_FOR_USER = [
   "--allowedTools",
 ];
 
-export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools }) {
+export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools, model }) {
   const isUser = role === "user";
   let args;
   if (isUser) {
@@ -75,6 +109,12 @@ export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPa
     args.push("--resume", sessionId);
   }
 
+  // 模型用别名（haiku/sonnet/opus），不是具体模型名 —— cc-switch 按槽位路由，
+  // 传模型名会被当成无效槽位键。见 config.js 的 claudeModel 注释。
+  if (model) {
+    args.push("--model", model);
+  }
+
   if (isUser) {
     for (const flag of FORBIDDEN_ARGS_FOR_USER) {
       if (args.includes(flag)) {
@@ -102,8 +142,9 @@ export function runClaude({
   timeoutMs,
   mcpTimeoutMs,
   role = "admin",
+  model,
 }) {
-  const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools });
+  const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools, model });
 
   // Working directory decides which project the session lands in, so a bad
   // value silently scatters sessions across the wrong folders.
@@ -139,11 +180,7 @@ export function runClaude({
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill();
-      } catch {
-        /* ignore */
-      }
+      killTree(child);
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
@@ -219,7 +256,7 @@ export function runClaude({
 // 但**磁盘文件不会变小**——所以不要用文件体积判断压缩是否生效。
 //
 // 耗时较长（大会话可达数分钟），调用方务必给足超时。
-export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sessionId, timeoutMs = 600000 }) {
+export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sessionId, timeoutMs = 600000, model }) {
   const args = [
     "-p",
     "/compact",
@@ -229,6 +266,10 @@ export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sess
     sessionId,
     "--dangerously-skip-permissions",
   ];
+
+  if (model) {
+    args.push("--model", model);
+  }
 
   const env = {
     HOME: homeDir,
@@ -256,11 +297,7 @@ export function compactSession({ exePath, baseUrl, authToken, homeDir, cwd, sess
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        child.kill();
-      } catch {
-        /* 已退出 */
-      }
+      killTree(child);
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {

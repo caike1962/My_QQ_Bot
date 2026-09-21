@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { stripImages } from "../src/session.js";
+import { stripImages, truncate } from "../src/session.js";
 
 const BIG = "A".repeat(50_000); // 模拟 base64 图片
 
@@ -148,4 +148,65 @@ test("stripImages: 缺少 source.data 的记录不报错", () => {
     const r = stripImages(file);
     assert.equal(r.replaced, 0);
   });
+});
+
+// ---------- truncate ----------
+//
+// 日志里打印用户消息 / 模型回复时截断。直接 slice 会把 emoji 的代理对切一半，
+// 落盘后那个字符变成 U+FFFD（�）——不抛错，但日志出现乱码会干扰排查。
+
+test("truncate: 短于上限时原样返回，不加省略号", () => {
+  assert.equal(truncate("你好", 10), "你好");
+  assert.equal(truncate("正好十个字啊啊啊", 8), "正好十个字啊啊啊");
+});
+
+test("truncate: 超长时截断并加省略号", () => {
+  assert.equal(truncate("abcdefghij", 5), "abcde…");
+});
+
+test("truncate: 不在 emoji 中间切断（关键）", () => {
+  // "a".repeat(4) + "😀" -> 代理对占 2 个 code unit，刚好横跨第 5、6 位
+  const s = "aaaa" + "😀" + "bbbb";
+  const out = truncate(s, 5);
+  // 第 5 位（index 4）是高位代理，必须回退，否则产生半个字符
+  assert.equal(out, "aaaa…");
+  assert.ok(!out.includes("�"), "不应产生替换字符");
+  // 验证落盘后不会被损坏
+  const dir = mkdtempSync(join(tmpdir(), "qqbot-trunc-"));
+  const f = join(dir, "t.txt");
+  writeFileSync(f, out, "utf8");
+  assert.ok(!readFileSync(f, "utf8").includes("�"), "落盘后不应出现 �");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("truncate: 上限落在 emoji 之后时正常截断", () => {
+  const s = "aaaa" + "😀" + "bbbb";
+  // 上限 7：末位 index 6 是 'b'（完整字符），不需要回退
+  assert.equal(truncate(s, 7), "aaaa😀b…");
+});
+
+test("truncate: 全 emoji 串不损坏", () => {
+  const s = "😀😀😀😀😀";
+  for (let n = 1; n <= 10; n++) {
+    const out = truncate(s, n);
+    assert.ok(!out.includes("�"), `上限 ${n} 产生了替换字符: ${JSON.stringify(out)}`);
+    // 不能出现孤立代理
+    for (let i = 0; i < out.length; i++) {
+      const c = out.charCodeAt(i);
+      const isLow = c >= 0xdc00 && c <= 0xdfff;
+      if (isLow) {
+        const prev = out.charCodeAt(i - 1);
+        assert.ok(prev >= 0xd800 && prev <= 0xdbff, `上限 ${n} 出现孤立低位代理`);
+      }
+    }
+  }
+});
+
+test("truncate: null/undefined 不抛错", () => {
+  assert.equal(truncate(null, 5), "");
+  assert.equal(truncate(undefined, 5), "");
+});
+
+test("truncate: 恰好等于上限时不加省略号", () => {
+  assert.equal(truncate("abcde", 5), "abcde");
 });

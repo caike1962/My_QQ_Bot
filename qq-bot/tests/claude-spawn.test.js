@@ -57,3 +57,33 @@ test("防呆清单：FORBIDDEN_ARGS_FOR_USER 完整覆盖已知泄漏面", () =>
   // user 分支合法构造时约束生效、不抛错（回归红线）
   assert.doesNotThrow(() => buildClaudeArgs({ ...BASE, role: "user" }));
 });
+
+// ---------- --model 透传 ----------
+//
+// 模型由 cc-switch 按槽位路由，传的必须是别名（haiku/sonnet/opus）。
+// 不传 model 时必须**完全不出现在参数里**，否则会改变上游模型选择。
+
+test("--model：未配置时不出现（保持原有行为）", () => {
+  for (const role of ["admin", "user"]) {
+    const args = buildClaudeArgs({ ...BASE, role });
+    assert.ok(!args.includes("--model"), `${role} 未配 model 时不应出现 --model`);
+  }
+});
+
+test("--model：配置后 admin 与 user 都带上", () => {
+  for (const role of ["admin", "user"]) {
+    const args = buildClaudeArgs({ ...BASE, role, model: "haiku" });
+    const i = args.indexOf("--model");
+    assert.ok(i !== -1, `${role} 应包含 --model`);
+    assert.equal(args[i + 1], "haiku");
+  }
+});
+
+test("--model：不影响 user 会话的权限约束", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "user", model: "haiku" });
+  for (const flag of FORBIDDEN_ARGS_FOR_USER) {
+    assert.ok(!args.includes(flag), `user 参数不应因 model 而包含 ${flag}`);
+  }
+  const modeIdx = args.indexOf("--permission-mode");
+  assert.equal(args[modeIdx + 1], "default", "权限模式仍须是 default");
+});

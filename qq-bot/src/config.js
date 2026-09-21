@@ -91,10 +91,35 @@ export function loadConfig() {
       .filter(Boolean),
     replyToSender: env.QQ_REPLY_TO_SENDER === "true",
 
+    // 群聊会话是否按「群」共享（默认开）。
+    //
+    // 开：全群共用一条 Claude 会话，A 问的问题 B 能接着问，
+    //     机器人回复时看得见彼此的上下文。代价是同一群的消息串行执行
+    //     （一次 spawn 可能几十秒），且上下文对全群可见。
+    // 关：退回旧的「群 + 人」隔离——每个人一条独立会话，互不干扰，
+    //     但同一群里的人无法讨论同一个问题。
+    groupSharedSession: env.QQ_GROUP_SHARED_SESSION !== "false",
+
+    // 是否给群聊 prompt 加发送者前缀（默认开，如「[张三(12345)] 帮我看下」）。
+    // 共享会话下模型只能靠它区分是谁在说话，关掉请自行确认模型还能分清。
+    senderPrefix: env.QQ_SENDER_PREFIX !== "false",
+
     maxTurns: Number(env.QQ_MAX_TURNS) || 15,
     timeoutMs: Number(env.QQ_TIMEOUT_MS) || 300000,
     mcpTimeoutMs: Number(env.QQ_MCP_TIMEOUT_MS) || 30000,
     maxPromptChars: Number(env.QQ_MAX_PROMPT_CHARS) || 4000,
+
+    // 传给 claude 的 --model 值。**留空则完全不传该参数**（保持原有行为）。
+    //
+    // 为什么用别名而不是模型名：模型由 cc-switch 代理在服务端决定，
+    // 它按**槽位**（haiku/sonnet/opus）路由，而不是按模型名透传。
+    // 实测（2026-09-21）：
+    //   --model haiku              → 上游 deepseek-v4-flash     ← 想要便宜的就用这个
+    //   不传                       → 上游 deepseek-v4-flash-max ← 默认
+    //   --model deepseek-v4-flash  → 上游仍是 flash-max（模型名被当成槽位键，无效）
+    //   env ANTHROPIC_DEFAULT_HAIKU_MODEL=... → 被 cc-switch 忽略，完全无效
+    // 换模型请用别名，别写具体模型名。
+    claudeModel: env.QQ_CLAUDE_MODEL || "",
     // claude 失败后的重试次数。0 表示不重试。
     retryCount: Number.isInteger(Number(env.QQ_RETRY_COUNT))
       ? Number(env.QQ_RETRY_COUNT)
