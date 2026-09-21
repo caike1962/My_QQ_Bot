@@ -109,6 +109,37 @@ export function markNotified(id) {
   writeAll(entries);
 }
 
+// 被合并打断的那条：内容已经并入合并后的 prompt，不需要重放，
+// 但**也不能直接删**——它必须成为 notified 终态（而不是从磁盘消失），
+// 否则重启恢复时它既不在 queued 里、也不在 interrupted 里，
+// 就成了无人知晓的幽灵条目。
+//
+// 之所以叫 "merging" 而不是复用 "notified"：两者含义不同。
+// notified 是「已告知用户，等 ta 回继续」，merging 是「已并入新的一条，无需动作」。
+// 混用会让启动恢复把合并掉的条目当成待重放，凭空多执行一遍。
+export function markMerging(id) {
+  const entries = readAll();
+  const entry = entries.find((e) => e.id === id);
+  // queued 也要认：合并可能打断的是一条**还没轮到执行**的排队消息
+  // （用户在窗口内连发三条时，第二条尚未成为队首就被并进了合并）。
+  if (!entry || (entry.status !== "running" && entry.status !== "queued")) return;
+  entry.status = "merging";
+  entry.at = Date.now();
+  writeAll(entries);
+}
+
+// 合并被打断、但内容没能并入新条目时，退回 notified 终态：
+// 重启后按「已告知、等用户决定」处理，让用户回「继续」重放。
+// 若停在 merging，恢复逻辑既不重放也不通知——那条消息就真的静默丢了。
+export function markMergingAborted(id) {
+  const entries = readAll();
+  const entry = entries.find((e) => e.id === id);
+  if (!entry || entry.status !== "merging") return;
+  entry.status = "notified";
+  entry.at = Date.now();
+  writeAll(entries);
+}
+
 // 供启动恢复：把条目按到达顺序返回，交由调用方决定 queued 重放 / running 交由用户决定
 export function loadEntries() {
   return readAll();

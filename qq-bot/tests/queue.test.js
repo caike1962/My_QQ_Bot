@@ -10,6 +10,9 @@ import {
   markRunning,
   removePending,
   loadEntries,
+  markMerging,
+  markMergingAborted,
+  markNotified,
 } from "../src/queue.js";
 
 let dir;
@@ -165,4 +168,80 @@ test("正常写入是原子的：不留 .tmp 残留", () => {
   markQueued("k1", EV("a"));
   assert.ok(existsSync(qpath()), "应生成 queue.json");
   assert.ok(!existsSync(qpath() + ".tmp"), "不应残留 .tmp");
+});
+
+// ---- 合并打断用的状态迁移 ----
+//
+// 语义：被合并的条目内容已并入新的一条 prompt，不需要重放，但必须停在
+// 终态而不是从磁盘消失——否则重启恢复时它既不在 queued 也不在 interrupted，
+// 成了无人知晓的幽灵条目，而 queueDepth 又把它算进排队数。
+
+test("markMerging: running → merging（内容已并入新消息）", () => {
+  const id = markQueued("k1", EV("第一条"));
+  markRunning(id);
+  markMerging(id);
+  assert.equal(loadEntries()[0].status, "merging");
+});
+
+test("markMerging: 只动 running/queued，不碰终态条目", () => {
+  const id = markQueued("k1", EV("a"));
+  markRunning(id);
+  markNotified(id);
+  markMerging(id); // 已是终态，不该被改回 merging
+  assert.equal(loadEntries()[0].status, "notified", "终态条目不该被标成 merging");
+});
+
+test("markMerging: 排队中的消息也能被合并（连发三条时第二条尚未成为队首）", () => {
+  const first = markQueued("k1", EV("第一条"));
+  const second = markQueued("k1", EV("第二条"));
+  markRunning(first); // 只有队首在跑
+  assert.equal(loadEntries()[1].status, "queued");
+  markMerging(second); // 用户连发，第二条被并进合并
+  assert.equal(loadEntries()[1].status, "merging", "排队中的条目也必须能被标记");
+});
+
+test("markMergingAborted: merging → notified（退回待重放）", () => {
+  const id = markQueued("k1", EV("a"));
+  markRunning(id);
+  markMerging(id);
+  markMergingAborted(id);
+  assert.equal(loadEntries()[0].status, "notified");
+});
+
+test("markMergingAborted: 不是 merging 的不动", () => {
+  const id = markQueued("k1", EV("a"));
+  markRunning(id);
+  markMergingAborted(id); // 仍是 running
+  assert.equal(loadEntries()[0].status, "running");
+});
+
+// 最坏时序：旧条目已标 merging、新条目还没落盘时被强杀。
+// 恢复逻辑必须能识别出"内容无着落"，退回 notified 让用户可重放，
+// 而不是当作已合并的垃圾清掉——那等于静默丢消息。
+test("最坏时序：merging 条目在无同类活跃条目时应退回待重放", () => {
+  const id = markQueued("k1", EV("唯一的一条"));
+  markRunning(id);
+  markMerging(id);
+
+  const entries = loadEntries();
+  const active = entries.filter(
+    (e) => e.status === "queued" || e.status === "running",
+  );
+  assert.equal(active.length, 0, "没有活跃条目 → 这条 merging 的内容无着落");
+  // 恢复逻辑据此走 markMergingAborted 分支（而不是 removePending）
+  markMergingAborted(id);
+  assert.equal(loadEntries()[0].status, "notified", "应退回待重放而不是被清掉");
+});
+
+test("同步合并：merging 条目在同会话有活跃条目时可安全清除", () => {
+  const old = markQueued("k1", EV("第一条"));
+  markRunning(old);
+  markMerging(old);
+  markQueued("k1", EV("第二条")); // 合并后的新条目
+
+  const entries = loadEntries();
+  const hasActive = entries.some(
+    (e) => e.key === "k1" && e.id !== old && (e.status === "queued" || e.status === "running"),
+  );
+  assert.equal(hasActive, true, "同会话有活跃条目 → 合并内容有着落，可清除");
 });

@@ -36,13 +36,16 @@ function killTree(child) {
 }
 
 export class ClaudeError extends Error {
-  constructor(message, { code, stderr, cost, raw } = {}) {
+  constructor(message, { code, stderr, cost, raw, aborted = false } = {}) {
     super(message);
     this.name = "ClaudeError";
     this.code = code;
     this.stderr = stderr;
     this.cost = cost;
     this.raw = raw;
+    // 被合并打断而杀掉，区别于超时/崩溃等真失败。
+    // 调用方据此静默退出（这条消息已经并入新的一条，不该报错也不该重试）。
+    this.aborted = aborted;
   }
 }
 
@@ -143,6 +146,7 @@ export function runClaude({
   mcpTimeoutMs,
   role = "admin",
   model,
+  abortSignal,
 }) {
   const args = buildClaudeArgs({ role, prompt, sessionId, mcpConfigPath, allowedTools, model });
 
@@ -177,11 +181,53 @@ export function runClaude({
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child);
     }, timeoutMs);
+
+    // 合并打断：信号一到就杀进程树，并**立即**以 aborted 拒绝。
+    //
+    // 为什么不能等 close 事件再判 aborted：close 只保证进程退出了，
+    // 不保证它是被我们杀掉的。若 abort 恰好落在"模型已生成完整回复、
+    // 进程正要正常退出"的窗口里，close 会以成功路径先到——于是这次运行
+    // 正常返回、把回复发出去，而合并后的重跑又发一次，用户收到两条。
+    // 让 abort 本身成为权威，这个竞态就不存在了。
+    //
+    // 杀进程仍然要做：不杀的话它会继续往会话文件里写，和重跑的那条撞车。
+    const onAbort = () => {
+      if (aborted) return;
+      aborted = true;
+      killTree(child);
+      clearTimeout(timer);
+      reject(new ClaudeError("claude 被合并打断", { aborted: true }));
+    };
+    // abortSignal 传错必须**立刻报错**，不能静默降级。
+    //
+    // 曾经写成"不是 AbortSignal 就跳过"，结果一次调用方的笔误让打断完全失效：
+    // 进程照常跑完、回复照常发出，而合并后的重跑又发一次，用户收到两条内容。
+    // 这种"看起来装了 abort 其实没装"的失败模式最难排查——它没有任何症状。
+    // 宁可当场让这次调用失败。
+    //
+    // 注意收的是 **signal**（controller.signal），不是 controller 本身；
+    // 传反了是很容易犯的错，所以报错信息里带上构造器名字便于定位。
+    if (abortSignal !== undefined && abortSignal !== null) {
+      if (typeof abortSignal.addEventListener !== "function") {
+        clearTimeout(timer);
+        const got = abortSignal?.constructor?.name || typeof abortSignal;
+        reject(
+          new ClaudeError(
+            `abortSignal 不是有效的 AbortSignal（收到 ${got}）。` +
+              `若传的是 AbortController，请改传它的 .signal`,
+          ),
+        );
+        return;
+      }
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
@@ -197,6 +243,15 @@ export function runClaude({
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (abortSignal?.removeEventListener) abortSignal.removeEventListener("abort", onAbort);
+
+      // aborted 时 onAbort 已经 reject 过了，这里再 reject 一次没有副作用
+      // （Promise 只认第一次），保留是为了让"没装 abort 信号"的路径也能
+      // 在进程被杀后正确收尾。
+      if (aborted) {
+        reject(new ClaudeError("claude 被合并打断", { code, aborted: true }));
+        return;
+      }
 
       if (timedOut) {
         reject(new ClaudeError(`claude 超时（${Math.round(timeoutMs / 1000)}秒）`));

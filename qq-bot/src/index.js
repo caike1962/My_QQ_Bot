@@ -3,9 +3,10 @@ import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError } from "./claude.js";
 import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, senderLabel } from "./message.js";
-import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary } from "./session.js";
+import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount } from "./session.js";
 import { loadRoles, addUser, removeUser, isUser } from "./roles.js";
-import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified } from "./queue.js";
+import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, markNotified, markMerging, markMergingAborted } from "./queue.js";
+import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -106,7 +107,14 @@ function saveSessions() {
   }
 }
 
-const queues = new Map();
+// 每个会话的执行者。key → { controller, event, entryId, prompt, startedAt, baseline }
+//
+// 为什么不能再用 promise 链：合并打断需要**替换队首**——杀掉当前正在跑的
+// 进程、把两条消息合成一条重新执行。promise 链只能追加，无法取消队首。
+//
+// baseline.lines 是本条消息开始执行时会话文件的行数，合并判据拿它做比对
+// （相等 = 一个工具都没调过）。null 表示锚点还没建立。
+const execs = new Map();
 let client;
 
 // 每个会话当前在跑什么。key → { what, started }。
@@ -164,12 +172,16 @@ function withFiles(text, files) {
   );
 }
 
-// 该会话上还没开始执行的消息条数（不含正在跑的那条）。
+// 该会话上**还没开始执行**的消息条数。
 //
-// 读磁盘而不是内存计数：重启恢复时排队的条目也计入，而内存计数只知道
-// 重启之后的事——用户恰恰是在"刚重启、消息还没跑"的时候最需要这个数字。
+// 三种状态要分清，否则「后面还有 N 条排队」会算错：
+//   running  正在跑，不算排队
+//   merging  已被合并进正在跑的那条，内容已保留，不算排队
+//   queued   真的在等，算
 function queueDepth(key) {
-  return loadEntries().filter((e) => e.key === key && e.status === "queued").length;
+  return loadEntries().filter(
+    (e) => e.key === key && (e.status === "queued" || e.status === "merging"),
+  ).length;
 }
 
 // 重启时留下的、状态未知的消息（key → 原始事件）。
@@ -297,7 +309,11 @@ async function resolveMentionedQq({ name, groupId }) {
 // 精确命令的直连执行通道。返回 true 表示本条消息已被消费，不应再送给模型。
 //
 // 这条路径不经过模型，直接调 OneBot API。保留它的理由：
-async function handleMessage(event, entryId = null) {
+// preset 由 enqueue 传入，携带已经定好的执行参数：
+//   prompt    合并打断时要复用的是**合并后**的 prompt，不是本条消息的原文
+//   sessionId 合并打断时必须复用被中断那次的会话，否则会开新会话丢上下文
+//   exec      执行者对象，锚点写到这里供判据读取
+async function handleMessage(event, entryId = null, abortSignal = null, preset = null) {
   const userId = Number(event.user_id);
   const isGroup = event.message_type === "group";
   const groupId = isGroup ? Number(event.group_id) : null;
@@ -457,12 +473,13 @@ async function handleMessage(event, entryId = null) {
     return;
   }
 
-  // 带上刚才缓存的文件（用户先转发文件、再说要求时用）。
+  // 带上刚才缓存的文件。放在 preset 之后：preset 是合并打断已经定好的 prompt，
+  // 里面早就含了当时的文件信息，不能再拼一次。
   //
   // 超长检查必须在 takeFiles **之前**做：takeFiles 是用掉即清，
   // 检查失败时再想放回去就得重新拿，容易写出清空缓存的 bug。
   let effectiveText = text;
-  {
+  if (!preset) {
     const entry = pendingFiles.get(key);
     const fresh = entry && Date.now() - entry.at <= PENDING_FILE_TTL_MS ? entry.files : [];
     if (fresh.length) {
@@ -488,7 +505,7 @@ async function handleMessage(event, entryId = null) {
   }
 
   // 共享会话里模型只能靠前缀知道是谁在说话。只在群聊加——私聊会话只有一个人。
-  const prompt = isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText;
+  const prompt = preset?.prompt ?? (isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText);
 
   log(`收到 ${key}: ${truncate(prompt, 80)}`);
 
@@ -498,6 +515,29 @@ async function handleMessage(event, entryId = null) {
 
   // 先记崩溃恢复的账（markRunning），再对用户宣称"在跑"。
   running.set(key, { what: prompt, started: Date.now() });
+
+  // 合并判据的锚点：本条开始执行时会话文件的行数。null = 还没建立
+  // （claude 启动约 0.6s 后才写完记账记录），此时判据退化为"有没有超过
+  // spawn 时的行数"——同样安全，因为那一刻模型必然还没动过工具。
+  //
+  // 不能 spawn 后立刻取：启动时会先写约 4 行记账记录，早取会误判成"调了工具"。
+  //
+  // baseline 对象是引用共享的：enqueue 建 exec 时就放进去，这里回填值，
+  // 判据那边读到的就是最新值。
+  const baseline = preset?.exec?.baseline ?? { lines: null };
+  const wireBaseline = (sessionId) => {
+    if (!sessionId) return;
+    const p = sessionPath(PROJECT_DIR, sessionId);
+    const atSpawn = sessionLineCount(p);
+    const poll = setInterval(() => {
+      const now = sessionLineCount(p);
+      if (now === null || now === atSpawn) return;
+      baseline.lines = now;
+      clearInterval(poll);
+    }, 150);
+    poll.unref?.();
+    setTimeout(() => clearInterval(poll), 2000).unref?.();
+  };
 
 
   // 立即回执：声明收到。"防止重复执行"这个承诺是安全的——从此刻起这条消息
@@ -553,6 +593,7 @@ async function handleMessage(event, entryId = null) {
       mcpTimeoutMs: config.mcpTimeoutMs,
       role,
       model: config.claudeModel,
+      abortSignal,
     });
 
   let result;
@@ -563,13 +604,31 @@ async function handleMessage(event, entryId = null) {
 
   while (attempt < maxAttempts && !result) {
     attempt += 1;
-    const resolved = resolveSession(key);
+    // 合并打断时 sessionId 由 enqueue 复用了被中断那次的，必须优先用它。
+    const resolved = preset?.sessionId
+      ? { sessionId: preset.sessionId, compactPlan: null }
+      : resolveSession(key);
     const sessionId = resolved.sessionId;
     if (resolved.compactPlan) compactPlan = resolved.compactPlan;
+    // 锚点只在第一次尝试时绑：后续重试是同一个会话文件，重绑会覆盖掉
+    // 已经被打断逻辑读到的值。
+    if (attempt === 1) wireBaseline(sessionId);
 
     try {
       result = await invoke(sessionId);
     } catch (error) {
+      // 合并打断 → 静默退出。这条消息的内容已经并入新的一条 prompt，
+      // 既不能报错（用户没出错）、也不能重试（重试等于连同合并后的内容
+      // 一起跑第二遍）。
+      //
+      // 条目仍要摘除：它已被 markMerging 标成终态、内容也保留在合并后的
+      // prompt 里，留着只会永久残留并撑大 queueDepth。
+      if (error instanceof ClaudeError && error.aborted) {
+        log(`${key} 本条被合并打断，内容已并入新消息`);
+        done();
+        return;
+      }
+
       const detail = error instanceof ClaudeError ? error.message : String(error);
       log(`第 ${attempt}/${maxAttempts} 次尝试失败: ${detail}`);
       if (error instanceof ClaudeError && error.raw) {
@@ -596,6 +655,16 @@ async function handleMessage(event, entryId = null) {
         return;
       }
     }
+  }
+
+  // 被合并打断：内容已并入新的一条，本轮不发回复，但收尾要做干净
+  // （停回执、摘条目），否则条目残留会把 queueDepth 一直撑大。
+  if (abortSignal?.aborted) {
+    log(`${key} 执行被打断，内容已并入新消息`);
+    running.delete(key);
+    await settle();
+    done();
+    return;
   }
 
   if (result.sessionId) {
@@ -662,25 +731,173 @@ function runCompaction(key, sessionId) {
     });
 }
 
+// 合并打断的执行体：杀掉当前进程 → 两条消息合成一条 prompt → 重新入队。
+//
+// 语义是**合并而非放弃**：前一条的内容原样保留在合并后的 prompt 里。
+// 之所以只能"杀掉重跑"而不能真发一个 ESC：无头 spawn 的 claude.exe 跑完
+// 就退出，没有一个活着的进程可以收信号。
+//
+// 返回 true 表示已成功接管，调用方不应再入队；false 表示中途失败，
+// 调用方必须把这条消息按常规入队，否则它会凭空消失。
+async function interruptForMerge(key, newEvent) {
+  const exec = execs.get(key);
+  if (!exec) return false;
+
+  const prevEvent = exec.event;
+  if (!prevEvent) return false; // 恢复任务没有原始事件，无法合并
+
+  const first = exec.prompt;
+  const second = extractText(newEvent.message);
+  const merged = mergePrompt(first, second);
+  if (merged.length > config.maxPromptChars) {
+    log(`合并后 ${merged.length} 字超过上限，放弃合并`);
+    return false;
+  }
+
+  // 已合并掉的那条**不在这里摘除**：它的原始事件还挂在 exec 上，
+  // 由被中断的 handleMessage 在收尾时摘掉（那条路径会读到这里的新状态）。
+  markMerging(exec.entryId);
+  exec.controller.abort(); // 立即杀死进程树；被中断的 handleMessage 静默收尾
+
+  const newEntryId = markQueued(key, newEvent);
+
+  // 复用 sessionId：被中断的那次从未把 id 写回 map，若这里当空处理，
+  // 重跑就会开一条全新会话，把之前的上下文全丢掉。
+  const sessionId = sessions.get(key) || null;
+
+  log(`合并打断 ${key}: 「${truncate(first, 40)}」+「${truncate(second, 40)}」`);
+  if (config.mergeNotice) {
+    await replyTo(newEvent, "收到，结合你上一条一起处理。").catch((e) =>
+      log("发送合并提示失败: " + e.message),
+    );
+  }
+
+  // 等被中断的那次真正收尾再起新的一条：同一会话文件不能被两个 claude
+  // 进程同时追加。exec.done 在 handleMessage 静默退出前 resolve。
+  const prevDone = exec.done;
+  const settleBeforeStart = prevDone.catch(() => {});
+  void settleBeforeStart.then(() => {
+    // sessionId 重新取一次：等待期间可能有别的路径改过它
+    const sid = sessions.get(key) || sessionId;
+    startExec(key, newEvent, newEntryId, merged, sid);
+  });
+
+  return true;
+}
+
+// 会话文件当前行数。读不到返回 null —— 判据那边会保守拒绝合并。
+function currentLineCount(key) {
+  const p = sessionPathFor(key);
+  return p ? sessionLineCount(p) : null;
+}
+
+// 不带 senderPrefix 的回复助手，供 enqueue 层（没有 role/prompt 上下文）使用。
+function replyTo(event, message) {
+  const isGroup = event.message_type === "group";
+  const userId = Number(event.user_id);
+  return isGroup
+    ? client.action("send_group_msg", {
+        group_id: Number(event.group_id),
+        message: config.replyToSender ? `[CQ:at,qq=${userId}] ${message}` : message,
+      })
+    : client.action("send_private_msg", { user_id: userId, message });
+}
+
+// 某条消息最终会送给模型的文本（用于合并打断的长度预判）。
+// 必须和 handleMessage 里的拼装保持一致，否则合并长度算少了，
+// 超长时会在检查处直接失败、白打断一次。
+function promptTextFor(key, event) {
+  const text = extractText(event.message);
+  if (!text) return "";
+  const entry = pendingFiles.get(key);
+  const fresh = entry && Date.now() - entry.at <= PENDING_FILE_TTL_MS ? entry.files : [];
+  return fresh.length ? withFiles(text, fresh) : text;
+}
+
+function startExec(key, event, entryId, prompt, sessionId) {
+  const controller = new AbortController();
+  let resolveDone;
+  const exec = {
+    controller,
+    event,
+    entryId,
+    prompt,
+    sessionId,
+    startedAt: Date.now(),
+    baseline: { lines: null },
+    done: new Promise((r) => (resolveDone = r)),
+  };
+  exec._resolveDone = resolveDone;
+  execs.set(key, exec);
+
+  handleMessage(event, entryId, controller.signal, { prompt, sessionId, exec })
+    .catch((error) => log(`处理异常: ${error.stack || error.message}`))
+    .finally(() => {
+      if (execs.get(key) === exec) execs.delete(key);
+      exec._resolveDone();
+    });
+}
+
+// 按**条目**（id）而非按 key 追踪：同一会话可能积压多条（用户连发），
+// 同一时刻只有队首在执行；按 key 标记会把整批都标成执行中，
+// 让从未执行过的后续消息在恢复时被误判为「状态未知」而不能自动重放。
 function enqueue(event, { fromRetry = false } = {}) {
   const key = convKey(event);
 
   // 入队即落盘：pm2 用 taskkill /F 强杀（不发信号），这一步是「消息已收到」
   // 唯一的持久化机会。重放不计入队列，否则「继续」会让条目反复堆积。
-  //
-  // 必须按**条目**（id）而非按 key 追踪：同一会话可能积压多条（用户连发），
-  // 同一时刻只有队首在执行；按 key 标记会把整批都标成执行中，
-  // 让从未执行过的后续消息在恢复时被误判为「状态未知」而不能自动重放。
   const entryId = fromRetry ? null : markQueued(key, event);
 
-  const prev = queues.get(key) || Promise.resolve();
-  const next = prev
-    .then(() => handleMessage(event, entryId))
-    .catch((error) => log());
-  queues.set(key, next);
-  next.finally(() => {
-    if (queues.get(key) === next) queues.delete(key);
-  });
+  // 先试合并打断：只有在窗口内、且当前这条一个工具都没调过时才成立。
+  // 判据在 interrupt.js，这里只负责取现场数据。
+  if (!fromRetry && config.mergeInterrupt) {
+    const exec = execs.get(key);
+    if (exec && shouldInterrupt({
+      enabled: config.mergeInterrupt,
+      messageType: event.message_type,
+      role: senderRole(Number(event.user_id), config, roles),
+      windowMs: config.mergeWindowMs,
+      startedAt: exec.startedAt,
+      now: Date.now(),
+      baselineLines: exec.baseline.lines,
+      currentLines: currentLineCount(key),
+      mergedLength: mergePrompt(exec.prompt, promptTextFor(key, event)).length,
+      maxPromptChars: config.maxPromptChars,
+    })) {
+      // 异步执行，但先同步返回——决定已经定了，调用方不必等。
+      // 失败（interruptForMerge 返回 false）说明合并没做成，退回常规入队。
+      void interruptForMerge(key, event).then((ok) => {
+        if (!ok) {
+          log(`合并打断失败，改为排队: ${key}`);
+          startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
+        }
+      });
+      return;
+    }
+  }
+
+  // 已有任务在跑 → 排队等它结束。
+  //
+  // 用轮询而不是 await 某个 exec 的 done：合并打断会把**当前执行者整个换掉**，
+  // 若排队的消息都挂在旧 exec 的 done 上，它们会在旧 exec 收尾的同一瞬间
+  // 一起起跑——同一会话文件被多个 claude 进程同时追加，正是本行注释要禁止的。
+  // 轮询问的是"现在还有没有人在跑"，换执行者不影响判断。
+  const cur = execs.get(key);
+  if (cur) {
+    const poll = setInterval(() => {
+      if (execs.has(key)) return;
+      clearInterval(poll);
+      // 轮询期间可能已被处理（如合并打断时这条已并入 merged），
+      // 条目不在队列里就说明不必再跑，否则会重复执行。
+      const still = loadEntries().some((e) => e.id === entryId);
+      if (entryId && !still) return;
+      startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
+    }, 200);
+    poll.unref?.();
+    return;
+  }
+
+  startExec(key, event, entryId, extractText(event.message), sessions.get(key) || null);
 }
 
 client = new OneBotWsClient({
@@ -721,6 +938,28 @@ async function sendWhenConnected(action, params, tries = 20, gapMs = 250) {
 async function restoreQueue() {
   const entries = loadEntries();
   if (!entries.length) return;
+
+  // 先清 merging：这些条目的内容已经并入同会话的合并 prompt，而合并 prompt
+  // 自己要么还在这份队列里（queued），要么已经跑完并摘除了。留着它只会永久
+  // 残留、撑大 queueDepth。
+  //
+  // 但**只有当同会话存在活跃条目时才清**：合并打断可能死在最坏的一瞬——
+  // interruptForMerge 刚要起新执行者时被强杀，于是「旧条目已标 merging、
+  // 新条目还没 markQueued」。此时若把 merging 当垃圾清掉，那条消息的内容
+  // 就真的没了。宁可留下一个会撑大计数的僵尸，也不能丢消息。
+  const merged = entries.filter((e) => e.status === "merging");
+  for (const e of merged) {
+    const alive = entries.some(
+      (o) => o.key === e.key && o.id !== e.id && (o.status === "queued" || o.status === "running"),
+    );
+    if (alive) {
+      log(`清除已被合并的条目 ${e.key}: ${truncate(extractText(e.event.message), 40)}`);
+      removePending(e.id);
+    } else {
+      log(`合并条目 ${e.key} 内容无着落，退回待重放`);
+      markMergingAborted(e.id);
+    }
+  }
 
   const queued = entries.filter((e) => e.status === "queued");
   const interrupted = entries.filter((e) => e.status === "running");

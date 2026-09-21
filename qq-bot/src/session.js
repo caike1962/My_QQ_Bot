@@ -8,6 +8,22 @@ import { readFileSync, writeFileSync, statSync, existsSync } from "node:fs";
 const PLACEHOLDER_PNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
+// 会话文件当前有多少行。用于合并打断的判据：拿它和某一条消息开始执行时的
+// 行数比对，相等即说明这段时间一个工具都没调过（模型生成文本期间不写文件，
+// 实测见 interrupt.js 的说明）。
+//
+// 返回 null 表示读不到（文件不存在/读失败）。调用方**不能**把它当作 0——
+// "读不到"和"没有变化"是两回事，前者必须保守处理。
+export function sessionLineCount(filePath) {
+  if (!existsSync(filePath)) return null;
+  try {
+    const text = readFileSync(filePath, "utf8").trim();
+    return text ? text.split("\n").length : 0;
+  } catch {
+    return null;
+  }
+}
+
 export function sessionPath(projectDir, sessionId) {
   return `C:\\Users\\Administrator\\.claude\\projects\\${projectDir}\\${sessionId}.jsonl`;
 }
