@@ -11,6 +11,7 @@ import { parseReminder } from "./reminders.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
+import { formatHistory, historyBody } from "./history.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -205,6 +206,41 @@ function noteRecv(key, text) {
 // 但说话多的人会连着问好几次，所以按 60s 缓存。
 const groupSizeCache = new Map();
 const GROUP_SIZE_TTL_MS = 60_000;
+
+// 群聊最近消息的缓存。key → { lines, at }。
+//
+// 为什么要缓存：拉取是一次 WS 往返（实测约 100ms），而群里消息密集时
+// 可能几秒内连着 @ 好几次。30 秒内的记录足够新——「刚才那个」指的基本
+// 就是这半分钟里的事，重复拉取没有意义。
+//
+// 缓存的是**格式化后**的行，不是原始消息：原始 JSON 一条就有几百字符，
+// 留 20 条在内存里纯属浪费。
+const historyCache = new Map();
+const HISTORY_TTL_MS = 30_000;
+const HISTORY_MAX_KEYS = 10;
+
+// 拉取并格式化某群最近的消息。任何失败都返回空数组——
+// 这是锦上添花的上下文，绝不能因为它失败就让整条消息处理不下去。
+async function recentHistory(groupId) {
+  const key = String(groupId);
+  const hit = historyCache.get(key);
+  if (hit && Date.now() - hit.at < HISTORY_TTL_MS) return hit.lines;
+
+  let lines = [];
+  try {
+    const res = await client.action("get_group_msg_history", { group_id: Number(groupId) });
+    const msgs = res?.data?.messages ?? res?.data;
+    lines = formatHistory(msgs, { selfId: config.selfId });
+  } catch (error) {
+    log(`拉取群 ${groupId} 历史失败（本次不带上下文）: ${error.message}`);
+  }
+
+  historyCache.set(key, { lines, at: Date.now() });
+  if (historyCache.size > HISTORY_MAX_KEYS) {
+    historyCache.delete(historyCache.keys().next().value);
+  }
+  return lines;
+}
 
 // 会话文件尾部存着最近的真实活动。只读末尾 64 KB：诊断是即时命令，
 // 而会话文件可能几 MB，不值得整个读一遍。读到的第一行可能是被切开的
@@ -1118,7 +1154,33 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   }
 
   // 共享会话里模型只能靠前缀知道是谁在说话。只在群聊加——私聊会话只有一个人。
-  const prompt = preset?.prompt ?? (isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText);
+  const userLine =
+    preset?.prompt ??
+    (isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText);
+
+  // 群聊补上最近的消息记录，让"刚才那个"有东西可指。
+  //
+  // 放在用户那句话**之前**：先给背景、再给当前请求，模型读到最后那句时
+  // 手里已经有上下文了。反过来放的话，它读请求时还不知道背景是什么。
+  //
+  // 只在群聊、且不是合并重跑时加：preset.prompt 已经是合并好的定稿，
+  // 再拼一次会让两条消息各带一份历史。
+  // 只在群聊、且不是合并重跑时加。
+  //
+  // 判据是 preset?.prompt 而不是 preset：**每次**执行都会带一个 preset
+  // （startExec 传 { prompt, sessionId, exec }），只是普通消息的 prompt 为
+  // undefined——用 !!preset 判断会永远为真，历史一次都加不上。
+  const mergedPrompt = preset?.prompt;
+  let prompt = userLine;
+  if (isGroup && config.historyContext && !mergedPrompt) {
+    const lines = await recentHistory(groupId);
+    const body = historyBody(lines);
+    if (body) {
+      prompt = `${body}\n\n${userLine}`;
+      // 记行数不记内容：历史里含全群发言，日志里不该出现
+      log(`群 ${groupId} 带上最近 ${lines.length} 条消息作为上下文`);
+    }
+  }
 
   log(`收到 ${key}: ${truncate(prompt, 80)}`);
   noteRecv(key, prompt);
@@ -1557,6 +1619,9 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
       now: Date.now(),
       baselineLines: exec.baseline.lines,
       currentLines: currentLineCount(key),
+      // 注意这里没算群聊历史上下文那一段（约 450 字符）：合并打断只在
+      // 私聊生效（canMerge 要求 messageType === "private"），私聊不加历史，
+      // 所以这个估算不会偏低。若将来把合并放开到群聊，这里要一并补上。
       mergedLength: mergePrompt(exec.prompt, promptTextFor(key, event)).length,
       maxPromptChars: config.maxPromptChars,
     })) {
