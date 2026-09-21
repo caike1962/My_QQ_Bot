@@ -56,6 +56,16 @@ export function removeJobByIndex(path, index) {
   return removed;
 }
 
+// 按 name 删除。刻意重新读一次文件，而不是复用调用方手里那份数组：
+// fire() 发送是异步的，这期间「/提醒」可能刚加了一条，拿旧数组整体覆盖会把它抹掉。
+export function removeJob(path, name) {
+  const jobs = loadJobs(path);
+  const next = jobs.filter((j) => j.name !== name);
+  if (next.length === jobs.length) return null; // 已经不在了，重复执行安全
+  saveJobs(path, next);
+  return jobs.length - next.length;
+}
+
 function saveJson(path, data) {
   // 先写临时文件再改名：直接覆盖时若进程被杀，会留下半截 JSON，
   // 下次启动读不出来就静默丢任务。
@@ -66,6 +76,28 @@ function saveJson(path, data) {
   } catch {
     // 状态写不进去不该让调度器停摆：最坏结果是重启后可能重发一次
   }
+}
+
+// 停机期间跨过去的一次性任务不会再被 matches() 命中，启动时顺手清掉，
+// 否则用户会在列表里看到一条永远不触发的任务。
+//
+// 判定不能只看「日期已过」：当天已过点、但停机期间根本没发出去的（比如
+// 22:00 的任务在 23:30 才重启）日期仍是今天，按 > 比较会留住它。反过来，
+// 时间已过就无脑删又会把这种「其实还没发」的提醒弄丢。两者的分界正好就是
+// state 里的幂等键——它非空，说明这一次确实发过了，可以安全清；空着则
+// 保留，当天还有机会补发。日期已过的不看 state：任务已经彻底过期。
+function scheduledStamp(job) {
+  const [y, m, d] = job.date.split("-").map(Number);
+  const stamp = new Date(y, m - 1, d, Number(job.time.slice(0, 2)), Number(job.time.slice(3, 5)));
+  return Number.isNaN(stamp.getTime()) ? null : stamp.getTime();
+}
+
+export function isExpiredOnce(job, state, now) {
+  if (!job?.date || !job.time) return false;
+  const at = scheduledStamp(job);
+  if (at === null) return false;
+  if (at >= minuteStamp(now)) return false; // 这一次还没到点
+  return at === state[job.name];
 }
 
 function matches(job, now) {
@@ -159,6 +191,19 @@ export function startScheduler({ client, config, log = console.error, jobsPath, 
       const ms = Date.now() - started;
       if (sent?.status === "ok") {
         log(`[定时] ${job.name} 已推送给 ${job.target?.type}:${job.target?.id}（${ms}ms）`);
+        // 发完即删只针对一次性任务（带 date）：它此后再也不会被 matches() 命中，
+        // 留着只会在 /提醒 列表里显示成一条永久过期的任务。
+        // 每天重复/按星期重复的任务不带 date，原样保留。
+        // 顺序上必须晚于上面 state 的落盘：进程若在删除落盘后被强杀，重启时
+        // state 还在，不会重发；反过来则可能「既没发也没了」。
+        if (job.date) {
+          try {
+            removeJob(JOBS, job.name);
+          } catch (error) {
+            // 清理失败不能把一次成功的发送降级成失败，任务留在文件里等下轮兜底
+            log(`[定时] ${job.name} 已发送但清理失败: ${error.message}`);
+          }
+        }
       } else {
         log(`[定时] ${job.name} 发送失败: ${JSON.stringify(sent)}`);
       }
@@ -183,6 +228,31 @@ export function startScheduler({ client, config, log = console.error, jobsPath, 
 
   if (!existsSync(JOBS)) {
     log(`[定时] 未找到 ${JOBS}，调度器空转（建好文件后重启生效）`);
+  }
+
+  try {
+    const now = new Date();
+    const alive = [];
+    let dropped = 0;
+    for (const job of loadJobs(JOBS)) {
+      if (isExpiredOnce(job, state, now)) {
+        dropped++;
+        continue;
+      }
+      alive.push(job);
+    }
+    if (dropped) {
+      saveJobs(JOBS, alive);
+      // 删掉的 job 名生成的 state 键再也不会被引用，一并清掉，否则只增不减
+      const names = new Set(alive.map((j) => j.name));
+      for (const key of Object.keys(state)) {
+        if (!names.has(key)) delete state[key];
+      }
+      saveJson(STATE, state);
+      log(`[定时] 清理了 ${dropped} 条已过期的一次性任务`);
+    }
+  } catch (error) {
+    log(`[定时] 启动清理失败: ${error.message}`);
   }
 
   const timer = setInterval(tick, TICK_MS);

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startScheduler, loadJobs, saveJobs, addJob, removeJobByIndex } from "../src/scheduler.js";
+import { startScheduler, loadJobs, saveJobs, addJob, removeJob, removeJobByIndex, isExpiredOnce } from "../src/scheduler.js";
 
 const tmp = mkdtempSync(join(tmpdir(), "jobs-"));
 process.on("exit", () => rmSync(tmp, { recursive: true, force: true }));
@@ -14,6 +14,7 @@ const freshPath = () => join(tmp, `jobs-${seq++}.json`);
 const pad = (n) => String(n).padStart(2, "0");
 const now = new Date();
 const clock = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
 
 // 假的 client：只记录收到的 action，不真的发消息。
 function fakeClient({ failWith = null, failTimes = Infinity } = {}) {
@@ -112,6 +113,21 @@ test("removeJobByIndex: 越界返回 null 且不修改文件", () => {
   addJob(p, { name: "a", time: "08:00" });
   assert.equal(removeJobByIndex(p, 5), null);
   assert.equal(removeJobByIndex(p, 0), null);
+  assert.equal(loadJobs(p).length, 1);
+});
+
+test("removeJob: 按名字删除，只删指定那条", () => {
+  const p = freshPath();
+  addJob(p, { name: "a", time: "08:00" });
+  addJob(p, { name: "b", time: "09:00" });
+  assert.equal(removeJob(p, "a"), 1);
+  assert.deepEqual(loadJobs(p).map((j) => j.name), ["b"]);
+});
+
+test("removeJob: 目标不存在时返回 null 且不修改文件", () => {
+  const p = freshPath();
+  addJob(p, { name: "a", time: "08:00" });
+  assert.equal(removeJob(p, "不存在"), null);
   assert.equal(loadJobs(p).length, 1);
 });
 
@@ -280,4 +296,126 @@ test("任务文件缺失时安静空转，不抛错", async () => {
     const s = startScheduler({ client, config: cfg, log: () => {} });
     s.stop();
   });
+});
+
+// —— 一次性任务发完即删 ——
+
+test("一次性任务触发后从文件里移除", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    { name: "once", time: clock, date: today, text: "吃药", target: { type: "private", id: 1 } },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0), "应当触发发送");
+  assert.ok(await waitFor(() => loadJobs(p).length === 0), "发完应从 jobs.json 消失");
+  s.stop();
+});
+
+test("每天重复的任务触发后仍在文件里", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [{ name: "daily", time: clock, text: "起床", target: { type: "private", id: 1 } }]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(loadJobs(p).length, 1, "每天重复的任务不能被误删");
+  s.stop();
+});
+
+test("按星期重复的任务触发后仍在文件里", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    { name: "weekly", time: clock, weekdays: [now.getDay()], text: "健身", target: { type: "private", id: 1 } },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(loadJobs(p).length, 1, "按星期重复的任务不能被误删");
+  s.stop();
+});
+
+test("发送失败的一次性任务保留，不能凭空消失", async () => {
+  const p = freshPath();
+  // 非"未连接"的失败：走硬失败路径，不触发重试
+  const client = fakeClient({ failWith: "群不存在" });
+  saveJobs(p, [
+    { name: "once", time: clock, date: today, text: "会失败", target: { type: "private", id: 1 } },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(loadJobs(p).length, 1, "发送失败不得删除条目");
+  s.stop();
+});
+
+test("启动时清理已发过、时间已过的一次性任务（不触发才形成的僵尸）", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  const past = new Date(now.getTime() - 3600 * 1000); // 一小时前的整点
+  const t = `${pad(past.getHours())}:00`;
+  // 关键：任务时间不是当前分钟，本次启动不会触发它；state 里已有记录说明
+  // 停机前就发过了。不清理的话它会永远留在列表里。
+  saveJobs(p, [{ name: "zombie", time: t, date: today, text: "已经发过了", target: { type: "private", id: 1 } }]);
+  writeFileSync(`${p}.state`, JSON.stringify({ zombie: new Date(past).setMinutes(0, 0, 0) }));
+
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => loadJobs(p).length === 0), "今天已发过的僵尸任务应被清掉");
+  assert.equal(client.calls.length, 0, "不该再发一次");
+  s.stop();
+});
+
+test("启动时保留每天重复的任务", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [{ name: "daily", time: "23:59", text: "每天", target: { type: "private", id: 1 } }]);
+
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(loadJobs(p).length, 1, "重复任务不能被启动清理误删");
+  s.stop();
+});
+
+test("启动时保留今天已过点、但还没发出去的一次性任务", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  const past = new Date(now.getTime() - 3600 * 1000);
+  const t = `${pad(past.getHours())}:00`;
+  // state 里没有记录 = 停机期间错过了，任务当天仍有机会补发，不能删
+  saveJobs(p, [{ name: "missed", time: t, date: today, text: "错过了", target: { type: "private", id: 1 } }]);
+
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(loadJobs(p).length, 1, "还没发出去的一次性任务不能删");
+  s.stop();
+});
+
+// —— isExpiredOnce 边界 ——
+
+test("isExpiredOnce: 5 分钟后的一次性任务不判过期（state 空或非本分钟）", () => {
+  const now = new Date();
+  const at = new Date(now.getTime() + 5 * 60_000);
+  const job = { name: "n", time: `${pad(at.getHours())}:${pad(at.getMinutes())}`, date: today };
+  // state 是「已触发的分钟时间戳」。即便它与本分钟相同，时间没到也不该判过期。
+  assert.equal(isExpiredOnce(job, { n: at.setSeconds(0, 0) }, now), false);
+});
+
+test("isExpiredOnce: 无 date 的重复任务永不判过期", () => {
+  const job = { name: "d", time: "00:00", weekdays: [0, 1, 2, 3, 4, 5, 6] };
+  assert.equal(isExpiredOnce(job, { d: 1 }, new Date()), false);
+});
+
+test("isExpiredOnce: 字段缺失或非法时不抛错", () => {
+  const now = new Date();
+  assert.equal(isExpiredOnce(null, {}, now), false);
+  assert.equal(isExpiredOnce({ name: "x", date: "2020-01-01" }, {}, now), false, "缺 time 不判过期");
+  assert.equal(isExpiredOnce({ name: "x", time: "99:99", date: "2020-01-01" }, { x: 1 }, now), false);
 });
