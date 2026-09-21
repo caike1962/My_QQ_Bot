@@ -392,6 +392,37 @@ async function groupMemberCount(groupId) {
   }
 }
 
+// 给一条消息贴表情。
+//
+// 底层 API 名是 set_msg_emoji_like（**不是** MCP 工具名 set_group_reaction——
+// onebot-mcp 只负责映射，直连 WS 必须用底层名，否则 retcode 1404）。
+//
+// 返回 Promise，调用方决定要不要 await。失败只记日志：表情是锦上添花的示意，
+// 它失败了不该影响真正的回复流程，更不该抛出去打断任务。
+async function reactToMessage(event, { emojiId, what }) {
+  // message_id 是 OneBot 11 对群消息的标准字段，NapCat 实测为数字
+  // （且与 message_seq / real_id 同值）。取不到就跳过——没有 id 就无处可贴。
+  const messageId = event?.message_id;
+  if (messageId === undefined || messageId === null) {
+    log(`${what}跳过：事件里没有 message_id`);
+    return;
+  }
+  try {
+    const res = await client.action("set_msg_emoji_like", {
+      message_id: messageId,
+      emoji_id: String(emojiId),
+      set: true,
+    });
+    if (res?.status !== "ok") {
+      log(`${what}失败: ${JSON.stringify(res)}`);
+    } else {
+      log(`${what}：已给消息 ${messageId} 贴上表情 ${emojiId}`);
+    }
+  } catch (error) {
+    log(`${what}异常: ${error.message}`);
+  }
+}
+
 // 超过 maxReplyChars 就截断并说明。这是"连文件都发不出"时的最后兜底。
 //
 // 截断用 session.js 的 truncate 而不是 Array.from(...).slice(...)：
@@ -1247,19 +1278,29 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
 
   // 立即回执：声明收到。"防止重复执行"这个承诺是安全的——从此刻起这条消息
   // 就在内存里了，进程不死它就一定会被执行（要么成功要么报错）。
-  // 回执：到点还没跑完才发。跑完了就不发——秒回的闲聊因此不会多出一句
-  // 啰嗦的「收到」。
+  // 「正在处理」的示意：到点还没跑完才发，跑完了就不发——
+  // 秒回的闲聊因此不会多出任何噪音。
+  //
+  // 群聊与私聊用不同形式，因为两者的"打扰成本"差很多：
+  //   群聊 → 给那条消息贴个表情。不进消息流、不发通知、不占版面，
+  //          却让提问的人知道"它看见了"。发一条「收到，正在处理…」
+  //          等于在全群面前刷一行，几条并发就把聊天冲散了。
+  //   私聊 → 照旧发文字，附带排队条数（一对一，这些信息有用且不打扰）。
   //
   // depth 要减 1：排队命令在上一轮末才发起，任务跑得快时它很可能还没返回，
   // 队列里仍有本条自己，不减就会把"自己"算成"正在排队"。
   let ackTimer = null;
-  let ackSent = null; // 回执发送的 Promise，收尾时要等它落地
+  let ackSent = null; // 回执动作的 Promise，收尾时要等它落地
   if (config.ackMessage) {
     ackTimer = setTimeout(() => {
+      if (isGroup) {
+        ackSent = reactToMessage(event, {
+          emojiId: config.reactionEmoji,
+          what: "处理中示意",
+        });
+        return;
+      }
       const depth = Math.max(0, queueDepth(key) - 1);
-      // 不带发送者称呼：群里 reply() 已经用 [CQ:at,qq=...] 指明了对象，
-      // 再加一句「[蔡总(1765116032)]」是同一件事说两遍。
-      // 私聊更不必说——会话里本来就只有一个人。
       const text = `收到，正在处理…${depth ? `（后面还有 ${depth} 条排队）` : ""}`;
       ackSent = reply(text)
         .then((sent) => {
