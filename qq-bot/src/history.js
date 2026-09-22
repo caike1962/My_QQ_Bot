@@ -38,7 +38,7 @@ const SEGMENT_LABEL = {
 // 把一条消息渲染成 `[HH:MM] 谁: 说了什么`。
 //
 // 返回 null 表示这条没有可展示的内容（空消息），调用方跳过。
-export function formatHistoryLine(msg, { selfId, robots } = {}) {
+export function formatHistoryLine(msg, { selfId, robots, users } = {}) {
   const text = messageText(msg);
   if (!text) return null;
 
@@ -47,7 +47,7 @@ export function formatHistoryLine(msg, { selfId, robots } = {}) {
   const pad = (n) => String(n).padStart(2, "0");
   const stamp = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
-  return `[${stamp}] ${displayName(msg, selfId, robots)}: ${text}`;
+  return `[${stamp}] ${displayName(msg, selfId, { robots, users })}: ${text}`;
 }
 
 // 单条消息的正文。
@@ -89,25 +89,33 @@ function squeeze(s) {
 //
 // robots 里的号码加 `[机器人]` 前缀：模型在共享会话里分不清对面是人还是机器，
 // 而这两者该用完全不同的方式应对（对人要正常聊，对机器人要判断该不该收尾）。
-function displayName(msg, selfId, robots) {
+// users 也要传——两张名单都占的号码是人，见 isRobotSender。
+function displayName(msg, selfId, lists) {
   const raw = msg?.sender?.card || msg?.sender?.nickname || "";
   const name = String(raw)
     .replace(/[\[\]\r\n]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 24);
-  const tag = isRobotSender(msg, robots) ? "[机器人] " : "";
+  const tag = isRobotSender(msg, lists) ? "[机器人] " : "";
   if (name) return tag + name;
   const id = msg?.user_id ?? msg?.sender?.user_id;
   return id !== undefined ? tag + id : "?";
 }
 
-// 历史里的这个发送者是不是名单里的机器人。selfId 天然被 formatHistory 过滤掉，
-// 这里不必再排除自己。
-function isRobotSender(msg, robots) {
+// 历史里的这个发送者是不是名单里的机器人。
+//
+// **必须同时看 users 名单**：同一个号码两张名单都占时，他是人不是机器人
+// （roles.js 的 isRobot 也是这个优先级）。只查 robots 会让这个人的发言在
+// 历史里被标成 [机器人]，模型于是拿机器人那套判据对待他——最坏的结果是把
+// 一个真人"收尾"掉，之后再不理他。
+//
+// selfId 天然被 formatHistory 过滤掉，这里不必再排除自己。
+function isRobotSender(msg, { robots, users } = {}) {
   if (!Array.isArray(robots) || !robots.length) return false;
   const uid = Number(msg?.user_id ?? msg?.sender?.user_id);
   if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+  if (Array.isArray(users) && users.some((u) => Number(u) === uid)) return false;
   return robots.some((r) => Number(r?.id) === uid);
 }
 

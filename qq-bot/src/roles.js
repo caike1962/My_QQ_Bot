@@ -263,6 +263,33 @@ function cleanupTmp(tmp) {
   }
 }
 
+// ---- 一对一角色：一个号码只占一张名单 ----
+//
+// 同一个人不能既在 users 又在 robots 里。这条不变式以前只在**读**路径上兜底
+// （isRobot / isRobotPaused 先查 users），那能挡住"被静默"，但挡不住两处更
+// 隐蔽的后果：
+//
+//   1. **话语气质被改**：同时占两张名单时他是 user，走的是 user（纯聊天）会话，
+//      却带着机器人的收尾提示词——收尾机制对 user 根本不生效（代码只在
+//      isRobot 为真时才处理哨兵），模型白白被教了一套它用不上的协议。
+//   2. **历史标注错人**：history 那条路径的优先级判据是上一轮才补上的
+//      （在 index.js 的 history.js:41）。写路径不保证一致，就只能靠每个读者
+//      各自记得查两张表——已经漏过一次了。
+//
+// 所以改名单时**自动迁移**：加机器人就把他从 user 里摘掉，反之亦然。命令的
+// 意图很明确（"这个人/这个号是机器人"），与其回一句"请先移出用户名单"让
+// 用户跑两趟，不如一步到位，并在回执里说明做了什么。
+//
+// 存量数据（手改文件造成的双身份）由读路径的守卫兜着，表现为"按 user 算"。
+// 下一次有人用指令动这个号时，自动迁移会把文件修正成合法状态。
+function dropFromUsers(users, id) {
+  return users.filter((n) => n !== id);
+}
+
+function dropFromRobots(robots, id) {
+  return robots.filter((r) => r.id !== id);
+}
+
 // 拿一份"当前最新"的名单给 mutator 用。**不**接受缓存里的快照就直接改：
 // 那正是外部改动被覆盖的来源。loadRoles() 内部按 mtime 校验，变了就重读。
 function currentRoles() {
@@ -270,11 +297,16 @@ function currentRoles() {
 }
 
 // true=已添加；false=本来就在名单里
+//
+// 从 robots 迁过来时，他的暂停状态一并作废（人都不是机器人了，暂停没有意义）。
 export function addUser(qq) {
   const id = assertValidId(qq);
   const roles = currentRoles();
   if (roles.users.includes(id)) return false;
-  writeAll({ users: [...roles.users, id], robots: roles.robots });
+  writeAll({
+    users: [...roles.users, id],
+    robots: dropFromRobots(roles.robots, id),
+  });
   return true;
 }
 
@@ -283,16 +315,22 @@ export function removeUser(qq) {
   const id = assertValidId(qq);
   const roles = currentRoles();
   if (!roles.users.includes(id)) return false;
-  writeAll({ users: roles.users.filter((n) => n !== id), robots: roles.robots });
+  writeAll({ users: dropFromUsers(roles.users, id), robots: roles.robots });
   return true;
 }
 
 // true=已添加；false=本来就在名单里（已有条目原样保留，不重置它的暂停状态）
+//
+// 从 users 迁过来时改走机器人会话：受收尾机制管，权限也从 user（纯聊天）
+// 变成机器人（同样是纯聊天 + 收尾提示词）。
 export function addRobot(qq) {
   const id = assertValidId(qq);
   const roles = currentRoles();
   if (roles.robots.some((r) => r.id === id)) return false;
-  writeAll({ users: roles.users, robots: [...roles.robots, { id, paused: false }] });
+  writeAll({
+    users: dropFromUsers(roles.users, id),
+    robots: [...roles.robots, { id, paused: false }],
+  });
   return true;
 }
 
@@ -301,8 +339,29 @@ export function removeRobot(qq) {
   const id = assertValidId(qq);
   const roles = currentRoles();
   if (!roles.robots.some((r) => r.id === id)) return false;
-  writeAll({ users: roles.users, robots: roles.robots.filter((r) => r.id !== id) });
+  writeAll({ users: roles.users, robots: dropFromRobots(roles.robots, id) });
   return true;
+}
+
+// 一次调用同时报出"结果"和"顺带迁移了什么"，让回执能说清楚。
+// 返回 { changed, moved }：changed 为 false 表示本来就在目标名单里；
+// moved 为 "from-users" / "from-robots" / null。
+export function addUserWithMove(qq) {
+  const id = assertValidId(qq);
+  const roles = currentRoles();
+  if (roles.users.includes(id)) return { changed: false, moved: null };
+  const moved = roles.robots.some((r) => r.id === id) ? "from-robots" : null;
+  addUser(id);
+  return { changed: true, moved };
+}
+
+export function addRobotWithMove(qq) {
+  const id = assertValidId(qq);
+  const roles = currentRoles();
+  if (roles.robots.some((r) => r.id === id)) return { changed: false, moved: null };
+  const moved = roles.users.includes(id) ? "from-users" : null;
+  addRobot(id);
+  return { changed: true, moved };
 }
 
 // 手动开关暂停，不依赖模型判断。true=状态真的变了。

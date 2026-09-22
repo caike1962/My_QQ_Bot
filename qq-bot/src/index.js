@@ -12,7 +12,7 @@ import { BG_PREFIX_RE, parseBgCommand, parseNaturalTrigger, setBgPath, setBgLogg
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
 import { formatHistory, historyBody } from "./history.js";
-import { loadRoles, addUser, removeUser, isUser, isRobot, isRobotPaused, pausedRobots, setRobotPaused, addRobot, removeRobot, setRolesPath } from "./roles.js";
+import { loadRoles, removeUser, isUser, isRobot, isRobotPaused, pausedRobots, setRobotPaused, removeRobot, addUserWithMove, addRobotWithMove, setRolesPath } from "./roles.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -1205,8 +1205,11 @@ async function resolveMentionedQq({ name, groupId }) {
 
 // 执行一条机器人名单指令并回执。
 //
-// 与「将 X 添加为用户」同一套写法：先写盘（commit 内部保证），成功才更新内存，
-// 失败原样抛出，由调用方捞回来告诉用户——不"假装成功"。
+// 与「将 X 添加为用户」同一套写法：先写盘，成功才更新内存，失败原样抛出，
+// 由调用方捞回来告诉用户——不"假装成功"。
+//
+// 加机器人时会把他从用户名单里摘掉（一个号只能占一张名单），回执要说清楚，
+// 否则用户看到的是"我加了个机器人，结果他从用户列表里消失了"。
 async function applyRobotCommand({ action, qq, reply }) {
   const okText = {
     add: `已将 ${qq} 添加为机器人，我会在对话结束时自行收尾并不再回复它。`,
@@ -1222,13 +1225,25 @@ async function applyRobotCommand({ action, qq, reply }) {
   }[action];
 
   let changed;
-  if (action === "add") changed = addRobot(qq);
-  else if (action === "remove") changed = removeRobot(qq);
+  let moved = null;
+  if (action === "add") {
+    const r = addRobotWithMove(qq);
+    changed = r.changed;
+    moved = r.moved;
+  } else if (action === "remove") changed = removeRobot(qq);
   else if (action === "pause") changed = setRobotPaused(qq, true);
   else if (action === "resume") changed = setRobotPaused(qq, false);
   else throw new Error(`未知的机器人指令: ${action}`);
 
-  await reply(changed ? okText : alreadyText);
+  if (!changed) {
+    await reply(alreadyText);
+    return;
+  }
+  await reply(
+    moved === "from-users"
+      ? `${okText}（一个号只能占一个角色，已同时把他移出用户名单）`
+      : okText,
+  );
 }
 
 // /解除：把暂停中的机器人放出来。
@@ -1259,7 +1274,8 @@ async function handleRobotListCommand({ reply }) {
   if (!robots.length) {
     await reply(
       "机器人名单为空。\n添加：「将 <QQ号 或 @某人> 添加为机器人」\n" +
-        "查看：/机器人 列表　暂停：/机器人 暂停 <QQ号>",
+        "查看：/机器人 列表　暂停：/机器人 暂停 <QQ号>\n" +
+        "（一个号只能占一个角色，加进机器人名单会同时移出用户名单）",
     );
     return;
   }
@@ -1451,11 +1467,13 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       }
       try {
         if (roleCmd.action === "add") {
-          const added = addUser(qq);
+          const r = addUserWithMove(qq);
           await reply(
-            added
-              ? `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。`
-              : `${qq} 已在用户名单中。`,
+            !r.changed
+              ? `${qq} 已在用户名单中。`
+              : r.moved === "from-robots"
+                ? `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。（一个号只能占一个角色，已同时把他移出机器人名单）`
+                : `已将 ${qq} 添加为用户，ta 现在可以私聊或在群里 @ 我聊天了。`,
           );
         } else {
           const removed = removeUser(qq);

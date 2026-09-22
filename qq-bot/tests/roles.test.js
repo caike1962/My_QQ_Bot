@@ -157,19 +157,46 @@ test("pausedRobots: 只列暂停中的", () => {
 
 // 人类优先：同一个号码同时出现在两张名单里时，它是**人**不是机器人。
 // 顺序一漏，人就会被静默掉——这是本功能里后果最重的一种错。
-test("isRobot: 同时在 users 名单里时判为人（人类优先）", () => {
-  addUser(55555);
-  addRobot(55555);
+//
+// 这个状态现在**造不出来了**：addUser/addRobot 会自动迁移，一个号只占一张名单
+// （见 roles.js 的「一对一角色」注释）。所以要模拟的是**存量脏数据**——老版本
+// 留下的、或有人手改文件造成的双身份。读路径的守卫必须兜住它，否则升级后
+// 这些号会被静默。
+test("isRobot: 手改文件造成的双身份判为人（人类优先）", () => {
+  writeRoles({ users: [55555], robots: [{ id: 55555, paused: false }] });
   assert.equal(isRobot(55555), false);
   assert.equal(isRobotPaused(55555), false);
 });
 
 test("setRobotPaused: 对同时在 users 名单里的号无效（不会静默人类）", () => {
-  addUser(55555);
-  addRobot(55555);
+  writeRoles({ users: [55555], robots: [{ id: 55555, paused: false }] });
   // 强行置暂停：isRobotPaused 仍为 false，人类的消息不会被吞
   setRobotPaused(55555, true);
   assert.equal(isRobotPaused(55555), false);
+});
+
+// 一个号只占一张名单：加进一张就自动从另一张摘掉。
+// 这条不变式是"读路径守卫"之外的**第二道**防线，缺了它双身份会不断产生，
+// 而守卫只能兜住存量、兜不住新增。
+test("addRobot: 把已在 users 里的号加为机器人时自动移出 users", () => {
+  addUser(55555);
+  assert.equal(addRobot(55555), true);
+  assert.equal(isUser(55555), false, "不该同时占两张名单");
+  assert.equal(isRobot(55555), true);
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.users, [], "落盘也必须只有一张名单");
+  assert.deepEqual(onDisk.robots, [{ id: 55555, paused: false }]);
+});
+
+test("addUser: 把已在 robots 里的号加为用户时自动移出 robots", () => {
+  addRobot(55555);
+  setRobotPaused(55555, true);
+  assert.equal(addUser(55555), true);
+  assert.equal(isRobot(55555), false);
+  assert.equal(isUser(55555), true);
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.users, [55555]);
+  assert.deepEqual(onDisk.robots, [], "迁移时暂停状态一并作废");
 });
 
 test("loadRoles: robots 里的裸号码与非法项被归一", () => {
