@@ -112,6 +112,39 @@ export function stripLeadingMention(text, names) {
   return prefix ? out.slice(prefix.length).trim() : out;
 }
 
+// 该不该给这条消息贴「处理中」表情。返回要贴的 message_id，不贴则 null。
+//
+// 判据全是"贴了会出错或没意义"的硬条件，**不判当前忙不忙**——排队中的消息
+// 恰恰最需要这个反馈，那正是调用点（enqueue）要它的原因。
+//
+// 放在 message.js 而不是 index.js：它是个纯判据，而 index.js 一 import 就会
+// 连 NapCat，放那里就没法在不启动守护进程的前提下测。
+export function reactionEmojiFor(event) {
+  // 非群聊直接排除：贴表情是群聊专属形式（onebot-mcp 里那个工具就叫
+  // set_group_reaction），私聊的示意是文字回执。
+  if (event?.message_type !== "group") return null;
+
+  // 表情挂在原消息上，没有 id 就无处可贴。message_id 是 OneBot 11 对群消息
+  // 的标准字段，NapCat 实测为数字（且与 message_seq / real_id 同值）。
+  // 用 undefined/null 判缺失而不是 falsy——0 也是合法 id。
+  if (event.message_id === undefined || event.message_id === null) return null;
+
+  const raw = String(event.raw_message ?? "").trim();
+  // 空消息（纯图片、纯文件）没有"处理中"可言，贴了反而把它标记成一条
+  // 等待回答的提问。
+  if (!raw) return null;
+  // 纯表情消息不该再贴一个——那本身就是表情，等于刷屏。
+  //
+  // 判据是把 CQ 码整个剥掉之后**还有没有真实文字**，而不是"含不含 face"：
+  // 「[CQ:face,id=14] 这个怎么弄」里那句提问才是主体，按包含判断会把它
+  // 一起漏掉，而那正是最需要示意的消息。同理「[CQ:image,...] 看下这个」
+  // 也该贴。
+  const textOnly = raw.replace(/\[CQ:[^\]]*\]/g, "").trim();
+  if (!textOnly) return null;
+
+  return String(event.message_id);
+}
+
 // 判断群消息是否真的 @ 了机器人。两道信号：
 // 1) 结构性的 at 段 / CQ 码，qq 等于机器人账号（最可靠）；
 // 2) QQ 把 @ 转成文本时，文本以配置的群昵称开头（"First" / "@First"）。

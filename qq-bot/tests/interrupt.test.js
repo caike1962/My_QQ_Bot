@@ -15,13 +15,44 @@ const base = {
   maxPromptChars: 4000,
 };
 
-test("canMerge: 仅 admin 私聊", () => {
+test("canMerge: 私聊放行已知角色；群聊仅同一发送者", () => {
   assert.equal(canMerge({ messageType: "private", role: "admin" }), true);
-  assert.equal(canMerge({ messageType: "private", role: "user" }), false);
+  // user 会话本来就没有工具，重跑零副作用，所以一并放行
+  assert.equal(canMerge({ messageType: "private", role: "user" }), true);
+  // 角色未知（陌生人/将来新增的角色）一律不合并
   assert.equal(canMerge({ messageType: "private", role: null }), false);
-  // 群聊是共享会话，别人发言不该被我的第二条消息杀掉重跑
-  assert.equal(canMerge({ messageType: "group", role: "admin" }), false);
+  assert.equal(canMerge({ messageType: "private", role: "moderator" }), false);
   assert.equal(canMerge({ messageType: "private", role: "admin", enabled: false }), false);
+
+  // 群聊：同一个人补一句才合并——被打断的是他自己那次执行，语义同私聊
+  assert.equal(
+    canMerge({ messageType: "group", role: "admin", prevUserId: 7, userId: 7 }),
+    true,
+  );
+  assert.equal(
+    canMerge({ messageType: "group", role: "user", prevUserId: 7, userId: 7 }),
+    true,
+  );
+  // 别人发言不该被我的第二条消息杀掉重跑
+  assert.equal(
+    canMerge({ messageType: "group", role: "admin", prevUserId: 7, userId: 8 }),
+    false,
+  );
+  // 身份拿不到（恢复任务没有原始事件、事件缺 user_id）→ 保守拒绝
+  assert.equal(canMerge({ messageType: "group", role: "admin" }), false);
+  assert.equal(
+    canMerge({ messageType: "group", role: "admin", prevUserId: NaN, userId: 7 }),
+    false,
+  );
+  assert.equal(
+    canMerge({ messageType: "group", role: "admin", prevUserId: 7, userId: NaN }),
+    false,
+  );
+  // 其他 message_type（如 discuss）不放行
+  assert.equal(
+    canMerge({ messageType: "discuss", role: "admin", prevUserId: 7, userId: 7 }),
+    false,
+  );
 });
 
 test("sessionUntouched: 文件没变化才算没动过工具", () => {
@@ -62,10 +93,23 @@ test("shouldInterrupt: 合并后超长不打断（否则会撞 maxPromptChars �
   assert.equal(shouldInterrupt({ ...base, mergedLength: 4000 }), true);
 });
 
-test("shouldInterrupt: 非 admin 私聊一律不打断", () => {
-  assert.equal(shouldInterrupt({ ...base, role: "user" }), false);
-  assert.equal(shouldInterrupt({ ...base, messageType: "group" }), false);
+test("shouldInterrupt: 角色未知一律不打断；群聊要求同一发送者", () => {
+  // 陌生人 / 将来新增的角色：保守拒绝
+  assert.equal(shouldInterrupt({ ...base, role: null }), false);
+  assert.equal(shouldInterrupt({ ...base, role: "moderator" }), false);
   assert.equal(shouldInterrupt({ ...base, enabled: false }), false);
+  // user 档私聊放行（会话无工具，重跑零副作用）
+  assert.equal(shouldInterrupt({ ...base, role: "user" }), true);
+  // 群聊缺发送者身份时保守拒绝（宁可排队，也不误杀别人的执行）
+  assert.equal(shouldInterrupt({ ...base, messageType: "group" }), false);
+  assert.equal(
+    shouldInterrupt({ ...base, messageType: "group", prevUserId: 7, userId: 7 }),
+    true,
+  );
+  assert.equal(
+    shouldInterrupt({ ...base, messageType: "group", prevUserId: 7, userId: 8 }),
+    false,
+  );
 });
 
 test("shouldInterrupt: startedAt 非法时不打断", () => {

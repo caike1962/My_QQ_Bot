@@ -25,12 +25,23 @@
 // 一个诚实的局限：判据保证不丢工作，代价是**已经在调工具的任务几乎永远
 // 打断不了**。要覆盖那种，得允许截断做了一半的副作用——不值得。
 
-export function canMerge({ messageType, role, enabled = true }) {
+export function canMerge({ messageType, role, enabled = true, prevUserId, userId }) {
   if (!enabled) return false;
-  // 群聊是共享会话：别人正常发言会因为你的第二条消息被杀掉重跑，
-  // 且两人同时打字必然互相打断。只在私聊生效。
-  if (messageType !== "private") return false;
-  return role === "admin";
+  // 角色必须已知。合并会杀掉正在跑的进程，所以默认保守：现在 admin 和 user
+  // 都放行（user 会话本来就没有工具，重跑零副作用），将来若新增角色，
+  // 它会自动落到"不合并"这一侧，而不是悄悄获得打断别人的能力。
+  if (role !== "admin" && role !== "user") return false;
+  if (messageType === "private") return true;
+  // 群聊默认不合并：共享会话下别人正常发言会因为你的第二条消息被杀掉重跑，
+  // 且两人同时打字必然互相打断。但那条理由只在**发送者不同**时成立——
+  // 同一个人补一句，被打断的正是他自己那次执行，语义和私聊完全一样。
+  //
+  // 所以群聊放行的前提是"上一条确实是同一个人发的"。身份要两边都拿得到：
+  // 恢复任务没有原始事件、或事件里缺 user_id 时一律不合并——宁可少合并
+  // （第二条照常排队），也不要误杀别人的执行。
+  if (messageType !== "group") return false;
+  if (!Number.isFinite(prevUserId) || !Number.isFinite(userId)) return false;
+  return prevUserId === userId;
 }
 
 // 会话文件相对 sentinel 有无变化。
@@ -56,6 +67,8 @@ export function shouldInterrupt({
   enabled = true,
   messageType,
   role,
+  prevUserId,
+  userId,
   windowMs,
   startedAt,
   now,
@@ -64,7 +77,7 @@ export function shouldInterrupt({
   mergedLength,
   maxPromptChars,
 }) {
-  if (!canMerge({ messageType, role, enabled })) return false;
+  if (!canMerge({ messageType, role, enabled, prevUserId, userId })) return false;
   if (!Number.isFinite(startedAt) || now - startedAt > windowMs) return false;
   if (!sessionUntouched({ baselineLines, currentLines })) return false;
   if (mergedLength > maxPromptChars) return false;

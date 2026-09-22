@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSyn
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
-import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand } from "./message.js";
+import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, reactionEmojiFor } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, setQueuePath, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
@@ -149,6 +149,54 @@ let client;
 // 登记时机在 markRunning **之后**：先保证崩溃恢复的账本记上了，
 // 再对外宣称"在跑"。
 const running = new Map();
+
+// 已排上「5 秒后贴示意表情」、但还没贴也没走到终态的条目 id。
+//
+// 计时起点是**收到消息那一刻**，不是轮到执行那一刻：用户在群里发完消息，
+// 心里等的就是"发出后 5 秒有没有动静"，而不是"排到我了之后 5 秒"。
+// 撤销点两处：定时器真的贴出（从本集合摘掉，转登记到 ackReacted）和 done()
+// （这条已经走到终态，不会再执行）。所以它的大小就是"当前待示意的条数"。
+const ackPending = new Set();
+
+// entryId → 定时器句柄。回复在 5 秒内发出时由 done() 撤销，
+// 这样秒回的闲聊不会多出任何噪音。
+const ackTimers = new Map();
+
+// 已经贴过示意表情的条目 id。
+//
+// 两条路径都可能贴：入队时挂的 5 秒定时器（主路径），以及 handleMessage
+// 里"执行超过 5 秒还没完"的兜底定时器（entryId 为 null 的重放/命令路径）。
+// 共用这一个集合去重，先到者登记，后来者看到就跳过——否则同一条消息的
+// 表情会亮两下。
+const ackReacted = new Set();
+
+// 群聊示意：推迟到"收到后 ackDelayMs 还没回复"才贴。
+function scheduleAckReaction(event, entryId) {
+  ackPending.add(entryId);
+  const timer = setTimeout(() => {
+    ackTimers.delete(entryId);
+    if (!ackPending.has(entryId)) return; // done() 已撤销：回复发出去了
+    ackPending.delete(entryId);
+    ackReacted.add(entryId);
+    void reactToMessage(event, {
+      emojiId: config.reactionEmoji,
+      what: "排队示意",
+    });
+  }, config.ackDelayMs);
+  timer.unref?.();
+  ackTimers.set(entryId, timer);
+}
+
+// 撤销待贴的示意。幂等：定时器已经触发过也照样安全。
+function cancelAckReaction(entryId) {
+  const timer = ackTimers.get(entryId);
+  if (timer) {
+    clearTimeout(timer);
+    ackTimers.delete(entryId);
+  }
+  ackPending.delete(entryId);
+  ackReacted.delete(entryId);
+}
 
 // 刚收到的文件，等用户说要怎么处理。key → { files: [...], at }。
 //
@@ -400,7 +448,8 @@ async function groupMemberCount(groupId) {
   }
 }
 
-// 给一条消息贴表情。
+// 给一条消息贴表情。该不该贴由 message.js 的 reactionEmojiFor 判（纯函数、
+// 可单测），这里只负责接到 WS 上。
 //
 // 底层 API 名是 set_msg_emoji_like（**不是** MCP 工具名 set_group_reaction——
 // onebot-mcp 只负责映射，直连 WS 必须用底层名，否则 retcode 1404）。
@@ -408,11 +457,9 @@ async function groupMemberCount(groupId) {
 // 返回 Promise，调用方决定要不要 await。失败只记日志：表情是锦上添花的示意，
 // 它失败了不该影响真正的回复流程，更不该抛出去打断任务。
 async function reactToMessage(event, { emojiId, what }) {
-  // message_id 是 OneBot 11 对群消息的标准字段，NapCat 实测为数字
-  // （且与 message_seq / real_id 同值）。取不到就跳过——没有 id 就无处可贴。
-  const messageId = event?.message_id;
-  if (messageId === undefined || messageId === null) {
-    log(`${what}跳过：事件里没有 message_id`);
+  const messageId = reactionEmojiFor(event);
+  if (!messageId) {
+    log(`${what}跳过：这条消息没有可贴的表情位（非群聊 / 无 message_id / 空消息）`);
     return;
   }
   try {
@@ -1191,6 +1238,10 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   // 且日积月累撑到体积上限，导致整个队列被丢弃、保护彻底失效。
   // 摘除是幂等的，正常路径结尾再摘一次无害。
   const done = () => {
+    // 顺带撤销还没贴出的示意表情：走到 here 说明这条已经有了结果（回复发出、
+    // 或提前拒绝），不该再在 5 秒后贴上"处理中"。撤销也要清掉定时器，否则
+    // 它仍会触发，只是因为集合里没了而空转一次。
+    if (entryId) cancelAckReaction(entryId);
     if (entryId) removePending(entryId);
   };
 
@@ -1560,15 +1611,29 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     preset?.prompt ??
     (isGroup && config.senderPrefix ? withSenderPrefix(effectiveText, event) : effectiveText);
 
+  // 回写到执行者对象上：合并打断要把这一条当"第一条"原样拼进合并后的 prompt，
+  // 而它是在这里才定下来的。
+  //
+  // 必须回写。startExec 传进来的 prompt 对普通消息恒为 null（三个调用点都传
+  // null），只有合并重跑才非空；原来没人回写，interruptForMerge 读到的就是
+  // null，mergePrompt 拼出来的是一个字面量 "null"。内容其实没丢——被杀的那次
+  // 已经把这条写进会话文件，重跑时 --resume 把它带了回来——所以这个 bug 一直
+  // 没暴露，但那行噪音一直在。
+  //
+  // 存 userLine 而不是下面的 prompt：群历史由合并后的那一次自己补（见下），
+  // 存进来会让历史夹在两条消息中间。
+  if (preset?.exec) preset.exec.prompt = userLine;
+
   // 群聊补上最近的消息记录，让"刚才那个"有东西可指。
   //
   // 放在用户那句话**之前**：先给背景、再给当前请求，模型读到最后那句时
   // 手里已经有上下文了。反过来放的话，它读请求时还不知道背景是什么。
   //
-  // 只在群聊、且不是合并重跑时加：preset.prompt 已经是合并好的定稿，
-  // 再拼一次会让两条消息各带一份历史。
+  // 合并重跑也要加，所以判据不再排除 mergedPrompt：exec.prompt 现在存的是
+  // 那一句人话（见上面的回写），合并后的 prompt 同样是两句人话拼的，历史
+  // 只在这里补一次，不会重复。
   let prompt = userLine;
-  if (isGroup && config.historyContext && !mergedPrompt) {
+  if (isGroup && config.historyContext) {
     const lines = await recentHistory(groupId, { isGroup: true });
     const body = historyBody(lines);
     if (body) {
@@ -1670,10 +1735,20 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   if (config.ackMessage) {
     ackTimer = setTimeout(() => {
       if (isGroup) {
-        ackSent = reactToMessage(event, {
-          emojiId: config.reactionEmoji,
-          what: "处理中示意",
-        });
+        // 群消息的正常路径由入队时的定时器负责：它从"收到消息"起算 5 秒，
+        // 起点比这里更早，因此总会先到。这里只兜它管不到的情况——重放
+        // （「继续」）和命令路径的 entryId 是 null，没有入队定时器。
+        //
+        // 判据要同时看两个集合：只查 ackPending，会把已经贴过的再贴一次；
+        // 只查 ackReacted，则会在入队定时器还没到点时就抢着贴。两者都没
+        // 登记，才说明这条确实没人管。
+        if (!entryId || (!ackPending.has(entryId) && !ackReacted.has(entryId))) {
+          if (entryId) ackReacted.add(entryId);
+          ackSent = reactToMessage(event, {
+            emojiId: config.reactionEmoji,
+            what: "处理中示意",
+          });
+        }
         return;
       }
       const depth = Math.max(0, queueDepth(key) - 1);
@@ -1921,11 +1996,27 @@ async function interruptForMerge(key, newEvent) {
   const prevEvent = exec.event;
   if (!prevEvent) return false; // 恢复任务没有原始事件，无法合并
 
-  const first = exec.prompt;
-  const second = extractText(newEvent.message);
+  // 第一条取 exec.prompt——它在 handleMessage 里被回写成"那一句人话"。
+  // 回写发生在几个 await 之后，极小概率这条还没跑到就来了第二条，此时退回
+  // 用原始事件重算一遍，避免把 null 拼进 prompt（旧版本正是这么漏的）。
+  const first = exec.prompt ?? promptTextFor(key, prevEvent);
+  // 第二段也走 promptTextFor，而不是直接 extractText：群聊要带上发送者标签，
+  // 否则合并后是「带标签的第一条 + 裸文本的第二条」，两条不成对。
+  const second = promptTextFor(key, newEvent);
+  // 兜底：预检已经挡过空内容，这里再挡一次。走到这一步说明马上就要 abort
+  // 掉正在跑的那条，若第二段贡献不出内容，这次打断就纯粹是白杀。
+  if (!second) {
+    log("合并跳过：新消息里没有可处理的文本");
+    return false;
+  }
   const merged = mergePrompt(first, second);
-  if (merged.length > config.maxPromptChars) {
-    log(`合并后 ${merged.length} 字超过上限，放弃合并`);
+  // 群聊还要加上合并那次会补的群历史（估算），否则判断偏乐观：
+  // 真进去以后 prompt 会比这里算出来的长一截，撞上限就白打断一次。
+  const budget =
+    merged.length +
+    (newEvent.message_type === "group" && config.historyContext ? GROUP_HISTORY_ESTIMATE : 0);
+  if (budget > config.maxPromptChars) {
+    log(`合并后 ${budget} 字超过上限，放弃合并`);
     return false;
   }
 
@@ -1941,7 +2032,10 @@ async function interruptForMerge(key, newEvent) {
   const sessionId = sessions.get(key) || null;
 
   log(`合并打断 ${key}: 「${truncate(first, 40)}」+「${truncate(second, 40)}」`);
-  if (config.mergeNotice) {
+  // 群里不发这句：群聊的示意形式是给原消息贴表情（零打扰），再往群里刷一行
+  // 文字是在全群面前多出一条消息，而合并本身只是"同一人补了一句"的内部动作。
+  // 私聊照发——一对一，说清楚为什么回的是两句话是有用的。
+  if (config.mergeNotice && newEvent.message_type !== "group") {
     await replyTo(newEvent, "收到，结合你上一条一起处理。").catch((e) =>
       log("发送合并提示失败: " + e.message),
     );
@@ -1978,15 +2072,37 @@ function replyTo(event, message) {
     : client.action("send_private_msg", { user_id: userId, message });
 }
 
-// 某条消息最终会送给模型的文本（用于合并打断的长度预判）。
+// 群聊 prompt 里那段"最近消息记录"的估算长度。
+//
+// 合并判据是同步的，而真实长度要异步拉一次群历史才知道，所以只能估。
+// 实测 20 条消息格式化后约 450 字符（见 history.js 头部注释），这里取 1500
+// 留足余量：估高了最坏是这次不合并、第二条照常排队；估低了才会真的撞上
+// maxPromptChars，白打断一次再失败。
+const GROUP_HISTORY_ESTIMATE = 1500;
+
+// 某条消息最终会送给模型的文本（用于合并打断的长度预判与合并拼接）。
 // 必须和 handleMessage 里的拼装保持一致，否则合并长度算少了，
 // 超长时会在检查处直接失败、白打断一次。
+//
+// 这里刻意**不含**群历史那一段：它由 handleMessage 在合并之后统一补，
+// 预判时用 GROUP_HISTORY_ESTIMATE 单独加。
 function promptTextFor(key, event) {
-  const text = extractText(event.message);
+  let text = extractText(event.message);
   if (!text) return "";
+  // 与 handleMessage 里 text 的推导保持一致：群聊先剥掉开头的称呼，
+  // 否则合并进去的还是「小八 帮我查下」这种带称呼的原文。
+  if (event.message_type === "group") {
+    text = stripLeadingMention(text, config.groupMentionNames);
+  }
   const entry = pendingFiles.get(key);
   const fresh = entry && Date.now() - entry.at <= PENDING_FILE_TTL_MS ? entry.files : [];
-  return fresh.length ? withFiles(text, fresh) : text;
+  if (fresh.length) text = withFiles(text, fresh);
+  // 形状也要和 userLine 一致：群聊带发送者标签。不带的话合并后是
+  // 「带标签的第一条 + 裸文本的第二条」，模型看到的两条不成对。
+  if (event.message_type === "group" && config.senderPrefix) {
+    text = withSenderPrefix(text, event);
+  }
+  return text;
 }
 
 // 必须**立即**执行的命令，绝不能当普通消息处理。
@@ -2031,6 +2147,13 @@ function startExec(key, event, entryId, prompt, sessionId) {
     return;
   }
 
+  // 到这里**不**撤销入队的示意图定时器——它按"收到后 5 秒"计时，而排队等
+  // 前面的任务跑完可能已经超过 5 秒，正是最该让提问的人知道"看见了"的时候。
+  // 摘除只发生在两处：定时器真的贴出，以及 done()（这条有了结果）。
+  //
+  // 命令分支走的是 runNow（entryId 变 null），以及将来可能新增的提前返回
+  // 路径，都不会走到这里，由 done() 统一兜底。
+
   const controller = new AbortController();
   let resolveDone;
   const exec = {
@@ -2068,6 +2191,26 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
   // 唯一的持久化机会。重放不再落新条目（markQueued），否则会反复堆积。
   const entryId = fromRetry ? replayId : markQueued(key, event);
 
+  // 入队时挂上示意定时器，到点还没回复才真的贴。
+  //
+  // 为什么计时起点放在这里（收到消息）而不是 handleMessage 里：排队中的
+  // 消息根本进不到 handleMessage——它卡在下面的 200ms 轮询里等前一条跑完，
+  // 以那里为起点的话，反馈延迟 = 前一条的剩余时长 + 5s，前面卡得越久越是
+  // 什么都看不到。从收到那一刻起算，用户看到的才是「发出后 5 秒」。
+  //
+  // 为什么不再立刻贴：秒回的闲聊占大多数，它们根本不需要示意，立刻贴等于
+  // 每条消息都留一个表情，成了噪音而不是反馈。慢的那些到点自然会贴出来，
+  // 而回复一旦发出，done() 会把定时器撤掉。
+  //
+  // 只在私聊跳过：贴表情是群聊专属形式，私聊的示意是文字回执。
+  //
+  // 去重按**条目 id**，不按会话 key：同一会话并发入队时（user 角色消息可以
+  // 绕过下面的轮询直接 startExec）各挂各的；合并后重新入队的是同一批 id，
+  // 不会重复挂。
+  if (config.ackMessage && event.message_type === "group" && entryId && !ackPending.has(entryId)) {
+    scheduleAckReaction(event, entryId);
+  }
+
   // 先试合并打断：只有在窗口内、且当前这条一个工具都没调过时才成立。
   // 判据在 interrupt.js，这里只负责取现场数据。
   //
@@ -2079,55 +2222,73 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
   // 消费掉了，能走到这里的「继续」只可能是没有待重放条目的普通闲聊词。
   if (!fromRetry && config.mergeInterrupt && !isDirectCommand(extractText(event.message))) {
     const exec = execs.get(key);
-    if (exec && shouldInterrupt({
+    // 第二段文本只算一次：既用于长度预判，也用于"空内容不合并"的判断。
+    // 没有文本（纯图片、纯表情、@ 了但什么都没说）时不能合并——合并会把
+    // 正在跑的那条杀掉重跑，而第二段贡献不出任何内容，等于白杀一次。
+    const second = promptTextFor(key, event);
+    if (exec && second && shouldInterrupt({
       enabled: config.mergeInterrupt,
       messageType: event.message_type,
       role: senderRole(Number(event.user_id), config, roles),
+      // 群聊只允许"同一个人补一句"时打断，所以要能回答"上一条是谁发的"。
+      // 身份挂在 exec.event 上；恢复任务没有原始事件，此处得到 NaN，
+      // canMerge 会因此保守拒绝合并。
+      prevUserId: Number(exec.event?.user_id),
+      userId: Number(event.user_id),
       windowMs: config.mergeWindowMs,
       startedAt: exec.startedAt,
       now: Date.now(),
       baselineLines: exec.baseline.lines,
       currentLines: currentLineCount(key),
-      // 注意这里没算群聊历史上下文那一段（约 450 字符）：合并打断只在
-      // 私聊生效（canMerge 要求 messageType === "private"），私聊不加历史，
-      // 所以这个估算不会偏低。若将来把合并放开到群聊，这里要一并补上。
-      mergedLength: mergePrompt(exec.prompt, promptTextFor(key, event)).length,
+      // 群聊要额外算上合并那次会补的"最近消息记录"：它不在 exec.prompt 里
+      // （见 handleMessage 的回写），只能按 GROUP_HISTORY_ESTIMATE 估。
+      mergedLength:
+        mergePrompt(exec.prompt, second).length +
+        (event.message_type === "group" && config.historyContext ? GROUP_HISTORY_ESTIMATE : 0),
       maxPromptChars: config.maxPromptChars,
     })) {
       // 异步执行，但先同步返回——决定已经定了，调用方不必等。
-      // 失败（interruptForMerge 返回 false）说明合并没做成，退回常规入队。
+      // 失败（interruptForMerge 返回 false）说明合并没做成，退回常规排队：
+      // 必须走 waitThenExec，不能直接 startExec——正在跑的那条还活着，
+      // 直接起新进程会让两个 claude 同时追加同一个会话文件。
       void interruptForMerge(key, event).then((ok) => {
-        if (!ok) {
-          log(`合并打断失败，改为排队: ${key}`);
-          startExec(key, event, entryId, null, sessions.get(key) || null);
-        }
+        if (ok) return;
+        log(`合并打断失败，改为排队: ${key}`);
+        waitThenExec(key, event, entryId);
       });
       return;
     }
   }
 
   // 已有任务在跑 → 排队等它结束。
-  //
-  // 用轮询而不是 await 某个 exec 的 done：合并打断会把**当前执行者整个换掉**，
-  // 若排队的消息都挂在旧 exec 的 done 上，它们会在旧 exec 收尾的同一瞬间
-  // 一起起跑——同一会话文件被多个 claude 进程同时追加，正是本行注释要禁止的。
-  // 轮询问的是"现在还有没有人在跑"，换执行者不影响判断。
-  const cur = execs.get(key);
-  if (cur) {
-    const poll = setInterval(() => {
-      if (execs.has(key)) return;
-      clearInterval(poll);
-      // 轮询期间可能已被处理（如合并打断时这条已并入 merged），
-      // 条目不在队列里就说明不必再跑，否则会重复执行。
-      const still = loadEntries().some((e) => e.id === entryId);
-      if (entryId && !still) return;
-      startExec(key, event, entryId, null, sessions.get(key) || null);
-    }, 200);
-    poll.unref?.();
+  if (execs.get(key)) {
+    waitThenExec(key, event, entryId);
     return;
   }
 
   startExec(key, event, entryId, null, sessions.get(key) || null);
+}
+
+// 等当前执行者收尾，再起这一条。
+//
+// 用轮询而不是 await 某个 exec 的 done：合并打断会把**当前执行者整个换掉**，
+// 若排队的消息都挂在旧 exec 的 done 上，它们会在旧 exec 收尾的同一瞬间一起
+// 起跑——同一会话文件被多个 claude 进程同时追加，正是要禁止的。轮询问的是
+// "现在还有没有人在跑"，换执行者不影响判断。
+//
+// 没有执行者时也会在下一拍起跑（200ms 后），所以调用方不必自己判断——但正常
+// 路径仍然直接调 startExec，免得白等一拍。
+function waitThenExec(key, event, entryId) {
+  const poll = setInterval(() => {
+    if (execs.has(key)) return;
+    clearInterval(poll);
+    // 轮询期间可能已被处理（如合并打断时这条已并入 merged），
+    // 条目不在队列里就说明不必再跑，否则会重复执行。
+    const still = loadEntries().some((e) => e.id === entryId);
+    if (entryId && !still) return;
+    startExec(key, event, entryId, null, sessions.get(key) || null);
+  }, 200);
+  poll.unref?.();
 }
 
 client = new OneBotWsClient({
