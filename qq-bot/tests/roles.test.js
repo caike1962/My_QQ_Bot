@@ -1,11 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setRolesPath, loadRoles, addUser, removeUser, isUser, isRobot, isRobotPaused, pausedRobots, addRobot, removeRobot, setRobotPaused } from "../src/roles.js";
 
 let dir;
+
+// 写文件并把 mtime 明确推后：热重载靠 mtime 判定"文件变了"，而测试跑得比
+// 文件系统的时间戳粒度（秒级）快得多，同一个毫秒里改两次会被误判成"没变"。
+// 生产里没这个问题——人改文件和进程读文件之间至少隔一次心跳。
+let stamp = Date.now();
+function writeRoles(data) {
+  const file = join(dir, "roles.json");
+  writeFileSync(file, JSON.stringify(data), "utf8");
+  stamp += 2000;
+  utimesSync(file, new Date(stamp), new Date(stamp));
+}
 
 test.beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "qqbot-roles-"));
@@ -196,4 +207,142 @@ test("removeUser: 改 users 不会丢掉 robots 名单", () => {
   addRobot(22334455);
   removeUser(12345678);
   assert.deepEqual(loadRoles(true).robots, [{ id: 22334455, paused: false }]);
+});
+
+// ---------- 热重载 ----------
+//
+// 这一组测的是"进程运行期间有人改了文件"——不必重启、不必 setRolesPath。
+
+test("热重载: 外部加人后立刻生效", () => {
+  loadRoles(); // 先建立缓存（文件此时还不存在）
+  assert.equal(isUser(12345678), false);
+
+  writeRoles({ users: [12345678], robots: [] });
+
+  // 没有重启、没有 setRolesPath，下一次查询就该看到新人
+  assert.equal(isUser(12345678), true, "外部改动应立即生效");
+});
+
+test("热重载: 外部加机器人并置暂停后立刻生效", () => {
+  loadRoles();
+  writeRoles({ users: [], robots: [{ id: 22334455, paused: true }] });
+  assert.equal(isRobot(22334455), true);
+  assert.equal(isRobotPaused(22334455), true);
+  assert.deepEqual(pausedRobots(), [22334455]);
+});
+
+test("热重载: 文件不存在时缓存成立，文件随后出现能被发现", () => {
+  assert.deepEqual(loadRoles(), { users: [], robots: [] });
+  writeRoles({ users: [111], robots: [{ id: 222, paused: true }] });
+  assert.equal(isUser(111), true);
+  assert.equal(isRobotPaused(222), true);
+});
+
+test("热重载: 文件被删除后退回空名单", () => {
+  writeRoles({ users: [12345678], robots: [] });
+  assert.equal(isUser(12345678), true);
+  rmSync(join(dir, "roles.json"));
+  assert.equal(isUser(12345678), false, "文件没了就该回到空名单");
+});
+
+// 最危险的失败模式：用户手改坏了文件，运行中的进程把名单清空，
+// 于是所有非 admin 立刻失去权限——而没人会想到是"文件保存了一半"。
+test("热重载: 文件损坏时保留旧名单，不清空", () => {
+  writeRoles({ users: [12345678], robots: [{ id: 22334455, paused: true }] });
+  assert.equal(isUser(12345678), true);
+
+  writeFileSync(join(dir, "roles.json"), "{ 半截 json", "utf8");
+
+  assert.equal(isUser(12345678), true, "读坏了不该把已有的人踢出去");
+  assert.equal(isRobotPaused(22334455), true);
+});
+
+test("热重载: 文件修好后能恢复到新内容", () => {
+  writeRoles({ users: [111], robots: [] });
+  assert.equal(isUser(111), true);
+
+  writeFileSync(join(dir, "roles.json"), "{ 坏", "utf8");
+  assert.equal(isUser(111), true, "坏文件期间沿用旧名单");
+
+  writeRoles({ users: [222], robots: [] });
+  assert.equal(isUser(111), false);
+  assert.equal(isUser(222), true, "修好后应读到新内容");
+});
+
+// 这是"写必须是 load-modify-write"的核心用例：进程内加人时，
+// 文件上已经有过一次外部改动，那次改动不能被覆盖掉。
+test("热重载: 进程内加人不会覆盖外部刚写进去的人", async () => {
+  writeRoles({ users: [111], robots: [] });
+  assert.equal(isUser(111), true);
+
+  // 外部再加一个（模拟用户手改，或另一个进程写）
+  writeRoles({ users: [111, 222], robots: [] });
+
+  // 进程内加第三个。它必须先读到 111 和 222，再写回三个。
+  assert.equal(addUser(333), true);
+
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.users, [111, 222, 333], "外部写进去的 222 不能被覆盖");
+});
+
+test("热重载: 进程内加机器人不会覆盖外部改动", () => {
+  writeRoles({ users: [], robots: [] });
+  loadRoles();
+
+  writeRoles({ users: [111], robots: [{ id: 222, paused: true }] });
+
+  assert.equal(addRobot(333), true);
+
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.users, [111], "外部加的人不能被覆盖");
+  assert.deepEqual(onDisk.robots, [
+    { id: 222, paused: true },
+    { id: 333, paused: false },
+  ]);
+});
+
+test("热重载: 外部把某人移出名单后，进程内改别的东西不会把他加回来", () => {
+  writeRoles({ users: [111, 222], robots: [] });
+  assert.equal(isUser(222), true);
+
+  // 外部把 222 移出
+  writeRoles({ users: [111], robots: [] });
+
+  // 进程内加第三个
+  assert.equal(addUser(333), true);
+
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.users, [111, 333], "被外部移出的 222 不该复活");
+});
+
+test("热重载: 外部改暂停状态后，进程内加机器人不会把它重置", () => {
+  writeRoles({ users: [], robots: [{ id: 222, paused: false }] });
+  loadRoles();
+
+  // 外部把它暂停
+  writeRoles({ users: [], robots: [{ id: 222, paused: true }] });
+
+  addRobot(333);
+
+  const onDisk = JSON.parse(readFileSync(join(dir, "roles.json"), "utf8"));
+  assert.deepEqual(onDisk.robots, [
+    { id: 222, paused: true },
+    { id: 333, paused: false },
+  ]);
+});
+
+test("热重载: 写入用临时文件再改名，不留半截 JSON", () => {
+  addUser(111);
+  const text = readFileSync(join(dir, "roles.json"), "utf8");
+  assert.doesNotThrow(() => JSON.parse(text), "写完的文件必须是完整 JSON");
+  assert.deepEqual(JSON.parse(text).users, [111]);
+});
+
+test("热重载: 多次写读交替后内容一致", () => {
+  for (let i = 0; i < 5; i++) {
+    addUser(1000 + i);
+    // 每次写完立刻读，确认 mtime 记账没把"自己刚写的"误判成外部改动
+    assert.equal(isUser(1000 + i), true, `第 ${i} 次写入后应能读到`);
+  }
+  assert.deepEqual(loadRoles().users, [1000, 1001, 1002, 1003, 1004]);
 });

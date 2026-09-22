@@ -278,6 +278,8 @@ export function loadConfig() {
 
     // 定时任务的配置文件。调度器每 20s 读一次，所以改完这个文件
     // **不需要重启**（与其它配置项不同）。
+    // 同为"改完即生效"的还有 roles.json（mtime 校验的按需重读），
+    // 以及 bot 自己的 `.state` 伴生文件。
     jobsPath: path(env.QQ_JOBS_PATH, "jobs.json"),
 
     // 长回复写的 HTML 报告、以及模型产出的其它文件都放这里。
