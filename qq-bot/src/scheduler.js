@@ -179,9 +179,18 @@ export function startScheduler({ client, config, log = console.error, jobsPath, 
           : text;
 
       const isGroup = job.target?.type === "group";
+      // 有 attendee 时发真正的 @（消息段数组），不是文本「@张三」——后者在
+      // QQ 里只是普通文字，不会给对方任何提醒。只有群聊能 @ 人，私聊保持纯文本。
+      const message =
+        isGroup && job.attendee?.qq
+          ? [
+              { type: "at", data: { qq: String(job.attendee.qq) } },
+              { type: "text", data: { text: " " + body } },
+            ]
+          : body;
       const params = isGroup
-        ? { group_id: Number(job.target.id), message: body }
-        : { user_id: Number(job.target?.id), message: body };
+        ? { group_id: Number(job.target.id), message }
+        : { user_id: Number(job.target?.id), message };
 
       const sent = await sendWithRetry(
         client,

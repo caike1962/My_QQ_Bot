@@ -166,6 +166,99 @@ test("群任务用 send_group_msg", async () => {
   s.stop();
 });
 
+// —— 带 attendee 的 @ 推送 ——
+
+test("群任务带 attendee 时拼出 at 段 + 正文", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    {
+      name: "at",
+      time: clock,
+      text: "去吃饭",
+      target: { type: "group", id: 456 },
+      attendee: { qq: 12345, name: "张三" },
+    },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  const msg = client.calls[0].params.message;
+  assert.ok(Array.isArray(msg), "带 @ 时必须发消息段数组，纯文本在 QQ 里不会渲染成 @");
+  assert.deepEqual(msg[0], { type: "at", data: { qq: "12345" } });
+  assert.deepEqual(msg[1], { type: "text", data: { text: " 去吃饭" } });
+  s.stop();
+});
+
+test("群任务没有 attendee 时仍发纯文本（回归）", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [{ name: "plain", time: clock, text: "开会", target: { type: "group", id: 456 } }]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  assert.equal(client.calls[0].params.message, "开会");
+  s.stop();
+});
+
+test("私聊任务即便带了 attendee 也发纯文本（私聊没有 @ 这回事）", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    {
+      name: "pm",
+      time: clock,
+      text: "吃药",
+      target: { type: "private", id: 7 },
+      attendee: { qq: 12345 },
+    },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  assert.equal(client.calls[0].action, "send_private_msg");
+  assert.equal(client.calls[0].params.message, "吃药");
+  s.stop();
+});
+
+test("attendee 号码等于机器人自己或群主：照旧发送，不崩", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    {
+      name: "self",
+      time: clock,
+      text: "该开会了",
+      target: { type: "group", id: 456 },
+      attendee: { qq: 10001 },
+    },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  assert.equal(client.calls[0].params.message[0].data.qq, "10001");
+  s.stop();
+});
+
+test("attendee 缺 qq 时退回纯文本（不给 NapCat 发空 at 段）", async () => {
+  const p = freshPath();
+  const client = fakeClient();
+  saveJobs(p, [
+    {
+      name: "bad",
+      time: clock,
+      text: "去吃饭",
+      target: { type: "group", id: 456 },
+      attendee: { name: "张三" },
+    },
+  ]);
+  const s = startScheduler({ client, config: baseConfig(p), log: () => {} });
+
+  assert.ok(await waitFor(() => client.calls.length > 0));
+  assert.equal(client.calls[0].params.message, "去吃饭");
+  s.stop();
+});
+
 test("时间不匹配的任务不触发", async () => {
   const p = freshPath();
   const client = fakeClient();

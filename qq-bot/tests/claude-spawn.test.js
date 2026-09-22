@@ -157,6 +157,46 @@ test("moderator 参数：附带群管提示词（不是 user/robot 那两份）"
   assert.notEqual(promptOf(mod), promptOf(buildClaudeArgs({ ...BASE, role: "robot" })));
 });
 
+// ---------- reminder：自然语言提醒的翻译会话 ----------
+//
+// 这个角色只做**翻译**（自然语言 → 一行哨兵），落盘由代码做。所以它需要的是
+// 与 user/robot 同一套"什么都没有"的权限，加上一份自己的提示词。
+// 安全敏感点：绝不能掉进 admin 分支——那会拿到 bypass 全权限，而它完全不需要。
+
+test("reminder 参数：不包含 bypass 与任何工具（只做翻译，不需要权限）", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "reminder" });
+  for (const flag of FORBIDDEN_ARGS_FOR_USER) {
+    assert.ok(!args.includes(flag), `reminder 参数不应包含 ${flag}`);
+  }
+});
+
+test("reminder 参数：走 default 权限模式", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "reminder" });
+  const modeIdx = args.indexOf("--permission-mode");
+  assert.ok(modeIdx !== -1, "应包含 --permission-mode");
+  assert.equal(args[modeIdx + 1], "default");
+});
+
+test("reminder 参数：附带自己的提示词（与 user/robot/moderator 都不同）", () => {
+  const promptOf = (args) => args[args.indexOf("--append-system-prompt") + 1];
+  const rem = promptOf(buildClaudeArgs({ ...BASE, role: "reminder" }));
+  assert.ok(rem, "应包含 --append-system-prompt");
+  assert.notEqual(rem, promptOf(buildClaudeArgs({ ...BASE, role: "user" })));
+  assert.notEqual(rem, promptOf(buildClaudeArgs({ ...BASE, role: "robot" })));
+  assert.notEqual(rem, promptOf(buildClaudeArgs({ ...BASE, role: "moderator" })));
+  // 这条提示词的三个要点，各钉一条：说清输出格式、禁止自行换算日期、
+  // 禁止声称已经设好了（模型没有工具，声称成功就是撒谎）。
+  assert.match(rem, /<<提醒/);
+  assert.match(rem, /原样保留/);
+  assert.match(rem, /绝不要声称已经设好了提醒/);
+});
+
+test("reminder 参数：会话 resume 照常保留", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "reminder" });
+  assert.ok(args.includes("--resume"), "应支持 resume");
+  assert.equal(args[args.indexOf("--resume") + 1], "abc123");
+});
+
 test("moderator 参数：缺白名单时抛错（不静默降级成无工具会话）", () => {
   assert.throws(
     () => buildClaudeArgs({ ...BASE, role: "moderator", allowedTools: undefined }),

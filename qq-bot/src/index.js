@@ -7,6 +7,7 @@ import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta,
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, setQueuePath, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
 import { parseReminder } from "./reminders.js";
+import { parseReminderSentinel } from "./reminder-nl.js";
 import { startScheduler, loadJobs, addJob, removeJobByIndex } from "./scheduler.js";
 import { BG_PREFIX_RE, parseBgCommand, parseNaturalTrigger, setBgPath, setBgLogger, loadTasks, addTask, updateTask, peekResults, consumeResult, markDelivered, sweepInterrupted, admit, counts, formatResultBlock, runBackgroundTask } from "./bg.js";
 import { buildDiagnostic } from "./diagnostics.js";
@@ -1043,12 +1044,15 @@ const pendingBgPrompt = new Map();
 //
 // 顺序是刻意的：先落盘（addTask）→ 再回执 → 最后才 spawn。
 // 反过来的话，进程在「已回执、未落盘」之间被杀，用户还以为任务在跑。
-async function startBgTask({ task, reply }) {
+async function startBgTask({ task, reply, isGroup = false }) {
   const entry = addTask({ conv: task.conv, prompt: task.prompt });
 
   await reply(
-    `好的，已转到后台执行：「${truncate(task.prompt, 60)}」\n` +
-      `跑完我在这里发结果，这期间你可以继续聊天。（/bg 列表 查看，/bg 取消 1 中止）`,
+    receipt({
+      isGroup,
+      text: `好的，已转到后台执行：「${truncate(task.prompt, 60)}」`,
+      tip: "跑完我在这里发结果，这期间你可以继续聊天。（/bg 列表 查看，/bg 取消 1 中止）",
+    }),
   ).catch((e) => log("发送后台任务回执失败: " + e.message));
 
   const promise = runBgTask(entry);
@@ -1057,6 +1061,7 @@ async function startBgTask({ task, reply }) {
 }
 
 async function handleBgCommand({ event, text, key, role, reply, done }) {
+  const isGroup = isGroupConv(key);
   if (role !== "admin") {
     await reply("后台任务是管理员功能。").catch((e) => log("发送权限提示失败: " + e.message));
     done();
@@ -1066,6 +1071,11 @@ async function handleBgCommand({ event, text, key, role, reply, done }) {
   const cmd = parseBgCommand(text);
 
   if (!cmd || cmd.action === "help") {
+    // 帮助文本本身就是纯附加说明，群聊里整个不发——用户要帮助时会私聊或明问。
+    if (isGroup) {
+      done();
+      return;
+    }
     await reply(
       "后台任务：布置后我立刻回执，任务在独立会话里跑，你可以继续聊别的，跑完把结果发回来。\n" +
         "用法：\n" +
@@ -1080,9 +1090,9 @@ async function handleBgCommand({ event, text, key, role, reply, done }) {
   if (cmd.action === "list") {
     const mine = loadTasks().filter((t) => t.conv === key);
     if (!mine.length) {
-      await reply("本会话还没有后台任务。发「/bg <要做什么>」布置一条。").catch((e) =>
-        log("发送后台列表失败: " + e.message),
-      );
+      await reply(
+        receipt({ isGroup, text: "本会话还没有后台任务。", tip: "发「/bg <要做什么>」布置一条。" }),
+      ).catch((e) => log("发送后台列表失败: " + e.message));
     } else {
       const now = Date.now();
       const lines = mine.slice(-10).map((t, i) => {
@@ -1111,9 +1121,9 @@ async function handleBgCommand({ event, text, key, role, reply, done }) {
       .slice(-10);
     const target = mine[cmd.index - 1];
     if (!target) {
-      await reply(`没有第 ${cmd.index} 条任务。发「/bg 列表」看看有哪些。`).catch((e) =>
-        log("发送取消失败: " + e.message),
-      );
+      await reply(
+        receipt({ isGroup, text: `没有第 ${cmd.index} 条任务。`, tip: "发「/bg 列表」看看有哪些。" }),
+      ).catch((e) => log("发送取消失败: " + e.message));
       done();
       return;
     }
@@ -1151,11 +1161,14 @@ async function handleBgCommand({ event, text, key, role, reply, done }) {
     if (gate.reason === "conv") {
       const secs = Math.round((Date.now() - (gate.task.startedAt || Date.now())) / 1000);
       await reply(
-        `这个会话已经有一个后台任务在跑（「${truncate(gate.task.prompt, 30)}」，已 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒）。\n` +
-          `等它跑完，或者发「/bg 取消 1」结束它。`,
+        receipt({
+          isGroup,
+          text: `这个会话已经有一个后台任务在跑（「${truncate(gate.task.prompt, 30)}」，已 ${Math.floor(secs / 60)} 分 ${secs % 60} 秒）。`,
+          tip: "等它跑完，或者发「/bg 取消 1」结束它。",
+        }),
       ).catch((e) => log("发送上限提示失败: " + e.message));
     } else {
-      await reply(`后台任务已满（${gate.running}/${config.bgMax} 个在跑）。等一个跑完再发。`).catch((e) =>
+      await reply(`后台任务已满（${gate.running}/${config.bgMax} 个在跑）。`).catch((e) =>
         log("发送上限提示失败: " + e.message),
       );
     }
@@ -1164,7 +1177,7 @@ async function handleBgCommand({ event, text, key, role, reply, done }) {
   }
 
   done();
-  await startBgTask({ task: { conv: key, prompt }, reply });
+  await startBgTask({ task: { conv: key, prompt }, reply, isGroup });
 }
 
 
@@ -1202,6 +1215,196 @@ async function resolveMentionedQq({ name, groupId }) {
     return undefined;
   }
   return Number(hits[0].user_id);
+}
+
+// 面向用户的一句话回执。
+//
+// 群聊与私聊的区别只在**长度**，不在内容：群聊是全群可见的，每条消息都是对
+// 所有人的打扰，所以砍掉附加说明（用法提示、示例、"你还可以…"）；私聊一对一，
+// 多说一句不构成打扰，附上用法是净收益。这层区别必须走代码——让每个调用点
+// 自己判断"群聊该不该少说一句"，必然漂移成十几种口径。
+//
+// 注意群聊版不是"另一句话"，而是同一句话去掉尾巴——tip 永远是可选后缀。
+//
+// **失败提示里的正确写法不在此列**：当失败原因就是格式/写法不对时，正确写法是
+// 用户唯一的出路，属于必要信息而非冗余，群聊里也要给全（那种情况不要走这个函数）。
+function receipt({ isGroup, text, tip = "" }) {
+  return isGroup || !tip ? text : `${text}\n${tip}`;
+}
+
+// 会话是否来自群聊。给 handleBgCommand 这类只拿得到 conv 键、没有 event 的
+// 调用点用——conv 的格式由 message.js 的 conversationKey 定义。
+function isGroupConv(conv) {
+  return String(conv ?? "").startsWith("group:");
+}
+
+// 把 parseReminder 的结果落成一条任务并回执。
+//
+// 抽成函数是因为**两条入口逐字需要它**：/提醒 指令（格式化的写法）与自然语言
+// 提醒（模型翻译后走同一条路）。不抽出来的话，两份 attendee 解析与回执措辞
+// 必然漂移——而这两处正好是最容易出错的（@ 对象反查、dateHint 的措辞）。
+//
+// 返回 { job } 或 { error }。error 情况下**已经由本函数回过执了**，调用方
+// 只需 done() 并返回；不在两处各写一遍拒绝文案。
+async function buildReminderJob({ parsed, ats, isGroup, groupId, userId, reply }) {
+  // 被提醒的人：@号码 直接可用；@名字 要按群成员列表反查（私聊查不了，
+  // 只能让用户改写成号码）。查不到就明确拒绝——提醒发错人比发不出去更糟。
+  //
+  // 群里 @ 人时 QQ 通常发的是真正的 at 段，而 extractText 会把 at 段整个抹掉
+  // （名字在文本里根本不存在，只剩一个空格）。所以文本里没解析出 @ 对象时
+  // 回退到 at 段——排除机器人自己：指令前面那个「@机器人」是在对谁说话，
+  // 不是要提醒谁。
+  const otherAts = ats.filter((a) => String(a.qq) !== String(config.selfId));
+  let attendee = null;
+  if (parsed.job.attendee) {
+    const { qq, name } = parsed.job.attendee;
+    if (qq) {
+      attendee = { qq };
+    } else if (!isGroup) {
+      await reply(`私聊里认不出「${name}」，改成号码：/提醒 明天 21:00 @${name}的QQ号 内容`).catch(
+        (e) => log("发送失败: " + e.message),
+      );
+      return { error: "私聊里认不出名字" };
+    } else {
+      const resolved = await resolveMentionedQq({ name, groupId });
+      if (!resolved) {
+        await reply(`群里没有叫「${name}」的成员，或重名不止一个，没法确定提醒谁。`).catch(
+          (e) => log("发送失败: " + e.message),
+        );
+        return { error: "群里找不到该成员" };
+      }
+      attendee = { qq: resolved, name };
+    }
+  } else if (isGroup && otherAts.length) {
+    // 一次只支持 @ 一个人。两个以上说明用户想要的是别的（群发？多个提醒？），
+    // 与其挑一个猜，不如让他说清楚——提醒发错人比发不出去更糟。
+    if (otherAts.length > 1) {
+      await reply("一次只能 @ 一个人，请只 @ 一位要提醒的对象。").catch((e) => log("发送失败: " + e.message));
+      return { error: "@ 了多个人" };
+    }
+    attendee = { qq: Number(otherAts[0].qq), name: otherAts[0].name || null };
+  }
+
+  const job = {
+    // name 用时间戳而非用户输入：中文内容不适合做键名，
+    // 而且同名任务会被 addJob 去重覆盖——用户想要的通常是"再加一条"。
+    name: `r${Date.now()}`,
+    time: parsed.job.time,
+    text: parsed.job.text,
+    // 触发地 = 当前会话所在地：在哪问的就在哪推。
+    target: isGroup ? { type: "group", id: Number(groupId) } : { type: "private", id: userId },
+  };
+  if (parsed.job.date) job.date = parsed.job.date;
+  if (parsed.job.weekdays) job.weekdays = parsed.job.weekdays;
+  // attendee = 到点要 @ 的人，与 target（消息发到哪）是两回事。
+  // 只有群聊能 @ 人，私聊拿不到成员列表也 @ 不出去，所以私聊不落这个字段。
+  if (attendee && isGroup) job.attendee = attendee;
+
+  try {
+    addJob(config.jobsPath, job);
+    // 回执要写清三件事：什么时候、在哪、@ 谁。
+    //
+    // 日期的说法按用户原话走：他自己写了「明天」就回显「明天」，没写日期时
+    // 回显「今天/明天」而不是我们推断出的那个日期——用户没打过那个日期，
+    // 回显它只会让人怀疑解析。dateHint 只服务于这句文案，不落盘。
+    const when = job.weekdays
+      ? `每周${job.weekdays.map((d) => "日一二三四五六"[d]).join("、")} ${job.time}`
+      : job.date
+        ? `${parsed.job.dateHint || job.date} ${job.time}`
+        : `每天 ${job.time}`;
+    // 「只提醒这一次」必须说出来：没写「每天」或星期时任务发完即删，
+    // 用户不知道的话会以为设了个每日提醒，第二天没响才发现。
+    const onceNote = job.date && !job.weekdays ? "（只提醒这一次）" : "";
+    const who = job.attendee ? ` 在本群 @ ${job.attendee.name || job.attendee.qq}` : " 提醒你";
+    log(`新增定时提醒 ${job.name}: ${job.time} ${job.text}`);
+    // 回执只汇报执行结果本身，不附用法说明（见 receipt 的注释）。
+    await reply(
+      receipt({
+        isGroup,
+        text: `好的，${when}${who}：${job.text}${onceNote}`,
+        tip: "发「/提醒 列表」可查看，发「/提醒删除 序号」可取消。",
+      }),
+    ).catch((e) => log("发送确认失败: " + e.message));
+  } catch (error) {
+    log(`写入定时任务失败: ${error.message}`);
+    await reply(`设置提醒失败：${String(error.message).slice(0, 120)}`).catch((e) => log("发送失败: " + e.message));
+    return { error: "写盘失败" };
+  }
+  return { job };
+}
+
+// 自然语言提醒：跑一遍翻译会话，把结果落成任务。
+//
+// 为什么用独立会话（sessionId: null）：与定时任务、后台任务同理——复用聊天会话
+// 会把这次翻译的往返混进用户正在进行的对话，污染上下文；反过来用户聊到一半的
+// 内容也会渗进翻译里。
+//
+// 为什么用 role: "reminder" 而不是 "admin"：admin 分支是 bypass 全权限、且不带
+// 系统提示词（见 claude.js）。挂进受限分支则白送四道护栏——default 权限模式、
+// 无 MCP、无 allowedTools、以及 FORBIDDEN_ARGS_FOR_USER 的运行时断言 + 测试双保险。
+// 翻译这件事不需要任何工具，模型只负责输出一行哨兵。
+//
+// 失败路径都要回执，且要说清"什么都没发生"——这一整条链路存在的理由就是
+// 模型会假装成功（见调用点的注释），回执含糊等于把那个坑换了个地方。
+async function handleReminderNl({ text, ats, isGroup, groupId, userId, reply }) {
+  let result;
+  try {
+    result = await runClaude({
+      exePath: config.claudeExe,
+      baseUrl: config.claudeBaseUrl,
+      authToken: config.claudeAuthToken,
+      homeDir: config.claudeHome,
+      cwd: config.claudeCwd,
+      mcpConfigPath: config.claudeMcpConfig,
+      prompt: text,
+      sessionId: null,
+      allowedTools: config.allowedTools,
+      timeoutMs: config.timeoutMs,
+      mcpTimeoutMs: config.mcpTimeoutMs,
+      role: "reminder",
+      model: config.claudeModel,
+      label: `remind-nl ${truncate(text.replace(/\s+/g, " "), 30)}`,
+    });
+  } catch (error) {
+    log(`自然语言提醒翻译失败: ${error.message}`);
+    await reply(`没能理解这句提醒：${String(error.message).slice(0, 120)}`).catch((e) =>
+      log("发送失败: " + e.message),
+    );
+    return;
+  }
+
+  const sentinel = parseReminderSentinel(result.text);
+  const TIP = "写清楚一点，或者直接用指令：/提醒 这周四 下午4点 @张三 去占位置";
+
+  if (!sentinel) {
+    log(`自然语言提醒：模型没输出哨兵，原始输出 ${truncate(result.text, 120)}`);
+    // 失败原因是"模型没翻出来"，不是"用户的写法不对"——让用户重新说一遍
+    // 比让他抄格式更自然，所以群聊里省掉这段提示（私聊里附上是净收益）。
+    await reply(`没看懂这句提醒，我什么也没设置。${receipt({ isGroup, text: "", tip: TIP })}`).catch((e) =>
+      log("发送失败: " + e.message),
+    );
+    return;
+  }
+  if (sentinel.none) {
+    log(`自然语言提醒：模型判定不是提醒请求（${truncate(text, 40)}）`);
+    await reply(`这看起来不是在设提醒，我就没动。${receipt({ isGroup, text: "", tip: TIP })}`).catch((e) =>
+      log("发送失败: " + e.message),
+    );
+    return;
+  }
+
+  // 模型翻译出来的文本必须再过一遍**真正的解析器**：日期换算（「这周四」是哪天）
+  // 由代码算，模型算会算错，而算错一天用户是错过提醒之后才发现。
+  const parsed = parseReminder(`/提醒 ${sentinel.text}`);
+  if (parsed.error) {
+    log(`自然语言提醒：翻译结果解析失败（${truncate(sentinel.text, 60)}）: ${parsed.error}`);
+    // 这条的失败原因**就是**写法不对（模型翻歪了），正确格式是用户唯一的出路，
+    // 属于必要信息而非冗余——所以这里不按群聊精简，两个场景都给全。
+    await reply(`没看懂这句提醒，我什么也没设置。\n\n${TIP}`).catch((e) => log("发送失败: " + e.message));
+    return;
+  }
+
+  await buildReminderJob({ parsed, ats, isGroup, groupId, userId, reply });
 }
 
 // 执行一条机器人名单指令并回执。
@@ -1270,18 +1473,29 @@ async function handleUnpauseCommand({ cmd, isGroup, groupId, key, reply }) {
 }
 
 // /机器人 列表：一眼看清名单和谁被静默了。
-async function handleRobotListCommand({ reply }) {
+async function handleRobotListCommand({ reply, isGroup }) {
   const robots = loadRoles().robots;
   if (!robots.length) {
     await reply(
-      "机器人名单为空。\n添加：「将 <QQ号 或 @某人> 添加为机器人」\n" +
-        "查看：/机器人 列表　暂停：/机器人 暂停 <QQ号>\n" +
-        "（一个号只能占一个角色，加进机器人名单会同时移出用户名单）",
+      receipt({
+        isGroup,
+        text: "机器人名单为空。",
+        tip:
+          "添加：「将 <QQ号 或 @某人> 添加为机器人」\n" +
+          "查看：/机器人 列表　暂停：/机器人 暂停 <QQ号>\n" +
+          "（一个号只能占一个角色，加进机器人名单会同时移出用户名单）",
+      }),
     );
     return;
   }
   const lines = robots.map((r, i) => `${i + 1}. ${r.id}${r.paused ? "（已暂停：不再回复它）" : ""}`);
-  await reply(`共 ${robots.length} 个机器人：\n${lines.join("\n")}\n\n解除暂停：/解除 <QQ号>（不带号则全部解除）`);
+  await reply(
+    receipt({
+      isGroup,
+      text: `共 ${robots.length} 个机器人：\n${lines.join("\n")}`,
+      tip: "解除暂停：/解除 <QQ号>（不带号则全部解除）",
+    }),
+  );
 }
 
 // 精确命令的直连执行通道。返回 true 表示本条消息已被消费，不应再送给模型。
@@ -1405,7 +1619,7 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       if (robotCmd.action === "unpause") {
         await handleUnpauseCommand({ cmd: robotCmd, isGroup, groupId, key, reply });
       } else if (robotCmd.action === "list") {
-        await handleRobotListCommand({ reply });
+        await handleRobotListCommand({ reply, isGroup });
       } else {
         // target 表单要按名字反查号码；其余表单号码已在手上。
         const qq = robotCmd.qq ?? (await resolveMentionedQq({ name: robotCmd.name, groupId }));
@@ -1565,7 +1779,13 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     if (body === "列表" || body === "") {
       const jobs = loadJobs(config.jobsPath);
       if (!jobs.length) {
-        await reply("当前没有定时任务。\n添加：/提醒 每天 08:00 起床").catch((e) => log("发送失败: " + e.message));
+        await reply(
+          receipt({
+            isGroup,
+            text: "当前没有定时任务。",
+            tip: "添加：/提醒 每天 08:00 起床",
+          }),
+        ).catch((e) => log("发送失败: " + e.message));
         done();
         return;
       }
@@ -1577,12 +1797,18 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
             ? "一次性"
             : "每天";
         const where = j.target?.type === "group" ? `群${j.target.id}` : "私聊";
+        // 有 @ 对象的要标出来，否则同一个群里两条「去吃饭」看不出哪条是提醒谁。
+        const who = j.attendee ? `，@${j.attendee.name || j.attendee.qq}` : "";
         const what = String(j.text ?? j.prompt ?? "").slice(0, 20);
-        return `${i + 1}. ${when}（${repeat}，${where}）${what}`;
+        return `${i + 1}. ${when}（${repeat}，${where}${who}）${what}`;
       });
-      await reply(`共 ${jobs.length} 条定时任务：\n${lines.join("\n")}\n\n删除：/提醒删除 序号`).catch(
-        (e) => log("发送失败: " + e.message),
-      );
+      await reply(
+        receipt({
+          isGroup,
+          text: `共 ${jobs.length} 条定时任务：\n${lines.join("\n")}`,
+          tip: "删除：/提醒删除 序号",
+        }),
+      ).catch((e) => log("发送失败: " + e.message));
       done();
       return;
     }
@@ -1594,7 +1820,11 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       await reply(
         removed
           ? `已删除提醒：${removed.time} ${String(removed.text ?? "").slice(0, 20)}`
-          : `没有第 ${del[1]} 条，发「/提醒 列表」看看现有任务。`,
+          : receipt({
+              isGroup,
+              text: `没有第 ${del[1]} 条。`,
+              tip: "发「/提醒 列表」看看现有任务。",
+            }),
       ).catch((e) => log("发送失败: " + e.message));
       done();
       return;
@@ -1603,40 +1833,17 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     // 新增
     const parsed = parseReminder(text);
     if (parsed.error) {
-      await reply(`${parsed.error}\n\n写法示例：\n/提醒 每天 08:00 起床\n/提醒 工作日 09:30 开站会\n/提醒 明天 15:00 开会\n/提醒 2026-10-01 08:00 出发`).catch(
+      // 这里**不**走 receipt：失败原因就是写法不对时，正确写法是用户唯一的出路，
+      // 属于必要信息而不是冗余。群聊里同样要给全。
+      await reply(`${parsed.error}\n\n写法示例：\n/提醒 每天 08:00 起床\n/提醒 工作日 09:30 开站会\n/提醒 明天 晚上九点 @张三 去吃饭\n/提醒 2026-10-01 08:00 出发`).catch(
         (e) => log("发送失败: " + e.message),
       );
       done();
       return;
     }
 
-    const job = {
-      // name 用时间戳而非用户输入：中文内容不适合做键名，
-      // 而且同名任务会被 addJob 去重覆盖——用户想要的通常是"再加一条"。
-      name: `r${Date.now()}`,
-      time: parsed.job.time,
-      text: parsed.job.text,
-      // 触发地 = 当前会话所在地：在哪问的就在哪推。
-      target: isGroup ? { type: "group", id: Number(event.group_id) } : { type: "private", id: userId },
-    };
-    if (parsed.job.date) job.date = parsed.job.date;
-    if (parsed.job.weekdays) job.weekdays = parsed.job.weekdays;
-
-    try {
-      addJob(config.jobsPath, job);
-      const repeat = job.weekdays
-        ? `每周${job.weekdays.map((d) => "日一二三四五六"[d]).join("、")}`
-        : job.date
-          ? `${job.date} 仅一次`
-          : "每天";
-      log(`新增定时提醒 ${job.name}: ${job.time} ${job.text}`);
-      await reply(`好的，${repeat} ${job.time} 提醒你：${job.text}\n（发「/提醒 列表」可查看，发「/提醒删除 序号」可取消）`).catch(
-        (e) => log("发送确认失败: " + e.message),
-      );
-    } catch (error) {
-      log(`写入定时任务失败: ${error.message}`);
-      await reply(`设置提醒失败：${String(error.message).slice(0, 120)}`).catch((e) => log("发送失败: " + e.message));
-    }
+    // 落盘 + 回执（与自然语言提醒共用，见 buildReminderJob）
+    await buildReminderJob({ parsed, ats, isGroup, groupId, userId, reply });
     done();
     return;
   }
@@ -1753,6 +1960,34 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     } finally {
       diagnosing = false;
     }
+    done();
+    return;
+  }
+
+  // 自然语言提醒（仅 admin）。
+  //
+  // 位置：所有代码路径命令之后、模型被 spawn 之前——这是最后一个能整体接管的
+  // 位置，接管后完全不进正常聊天路径。
+  //
+  // 为什么要做这一条：用户说「这周四下午4点提醒张总去占位置」时，这句话进不了
+  // 上面的 /提醒 分支（不以 /提醒 开头），于是落到模型路径上。而模型**没有任何
+  // 工具能写 jobs.json**，它顶多回一句「好的，记下了」——实际什么都不会发生，
+  // 用户要到错过提醒之后才发现。这是本功能要解决的核心问题。
+  //
+  // 解法：模型只做**翻译**（自然语言 → qqbot 的语法），写成一行哨兵；代码解析
+  // 哨兵、用 parseReminder 校验、再落盘。模型永远不碰 jobs.json。
+  // 与「加人/移出用户」同一条红线（见 reminders.js 文件头）。
+  //
+  // 判据是含「提醒」二字——刻意宽松，因为漏判的代价（假装成功）远大于误判
+  // （多跑一次翻译会话，翻不出来就回一句说明）。见 config.js 的注释。
+  if (
+    config.reminderNatural &&
+    role === "admin" &&
+    !preset && // 合并打断已定好的 prompt 不重复处理
+    !/^\/提醒/.test(text.trim()) && // 已在上面的分支处理
+    text.includes("提醒")
+  ) {
+    await handleReminderNl({ text, ats, isGroup, groupId, userId, reply });
     done();
     return;
   }
@@ -2141,13 +2376,18 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       const gate = admit({ conv: key, max: config.bgMax });
       if (!gate.ok) {
         await reply(
-          gate.reason === "conv"
-            ? `这条看起来该转后台，但这个会话已经有一个后台任务在跑了（「${truncate(gate.task.prompt, 30)}」）。等它跑完再发一次。`
-            : `这条看起来该转后台，但后台任务已满（${gate.running}/${config.bgMax} 个在跑）。等一个跑完再发。`,
+          receipt({
+            isGroup,
+            text:
+              gate.reason === "conv"
+                ? `这条看起来该转后台，但这个会话已经有一个后台任务在跑了（「${truncate(gate.task.prompt, 30)}」）。`
+                : `这条看起来该转后台，但后台任务已满（${gate.running}/${config.bgMax} 个在跑）。`,
+            tip: "等一个跑完再发。",
+          }),
         ).catch((e) => log("发送上限提示失败: " + e.message));
         return;
       }
-      await startBgTask({ task: { conv: key, prompt: pending }, reply });
+      await startBgTask({ task: { conv: key, prompt: pending }, reply, isGroup });
       return;
     }
     pendingBgPrompt.delete(key);
@@ -2369,6 +2609,9 @@ function isDirectCommand(text) {
   if (!t) return false;
   if (parseDiagnosticCommand(t) || parseStatusCommand(t) || parseResetCommand(t)) return true;
   if (/^\/提醒/.test(t)) return true;
+  // 自然语言提醒同理：它要 spawn 一次翻译会话，被合并打断吞掉就等于用户
+  // 设了个提醒而实际什么都没发生——正是这条链路要消灭的那个坑。
+  if (config.reminderNatural && t.includes("提醒")) return true;
   // /bg 必须在这里认出来：认不出来的话，任务运行中发 /bg 会被合并打断吞掉、
   // 或者排到那条任务自己后面——恰恰在最需要它的时候失效。
   if (BG_PREFIX_RE.test(t)) return true;

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { truncate } from "./session.js";
 import { SILENT_END_MARK, SILENT_KEEP_MARK } from "./message.js";
+import { REMIND_MARK, REMIND_NONE } from "./reminder-nl.js";
 
 // 活着/刚活过的 claude 子进程。给 /诊断 用。
 //
@@ -116,6 +117,44 @@ const ROBOT_SYSTEM_PROMPT =
   "不存在授权弹窗：你不会得到任何新权限，不要请求对方批准，也不要重复尝试。" +
   "不要编造执行结果——你从未执行过任何操作。";
 
+// 提醒翻译会话的附加提示词。任务是**翻译**，不是执行。
+//
+// 与 user/robot 一样什么工具都没有，但目的不同：那两个是"别做多余的事"，
+// 这个是把自然语言改写成 qqbot 听得懂的语法，交给代码去落盘。
+//
+// 三条约束各自的来由：
+//   1. 时间原样保留，绝不换算 —— 这是本设计的关键。让模型算「这周四」是哪天
+//      会算错，而算错一天用户是错过提醒之后才发现。日期换算交给 reminders.js，
+//      它是确定性的、有单测的。
+//   2. 输出哨兵而不是 /提醒 命令 —— 哨兵是数据边界，代码只从里面取内容。
+//      模型输出可执行文本的话，下一步就是有人把它当命令执行。
+//   3. 绝不许说"已经设好了" —— 最危险的一点（见文件头）。它没有任何工具，
+//      声称成功就是撒谎，而用户会因此错过提醒。
+const REMINDER_SYSTEM_PROMPT =
+  "你的唯一任务：把用户这句话改写成一行提醒指令，用哨兵包起来。" +
+  `格式：${REMIND_MARK} 时间 @对象 说明 >>` +
+  "**每一段之间必须用空格隔开，这是硬要求**——程序靠空格切分。" +
+  "漏掉空格会导致整句无法解析，用户的提醒就设不上。宁可多加空格，也不要粘连。" +
+  "写法示例（输入 → 你的输出）：" +
+  "「这周四下午4点钟提醒张总去占位置」→" +
+  `${REMIND_MARK} 这周四 下午4点钟 @张总 去占位置 >>；` +
+  "「记得晚上九点提醒一下张三去吃饭」→" +
+  `${REMIND_MARK} 晚上九点 @张三 去吃饭 >>；` +
+  "「每周四下午4点提醒张总去占位置」→" +
+  `${REMIND_MARK} 每周四 下午4点 @张总 去占位置 >>。` +
+  "注意示例里：时间说法原样保留、@ 对象单独成段、说明单独成段。" +
+  "**时间说法绝不要自己换算成日期或改写成别的说法**：" +
+  "用户说「这周四」就写「这周四」，说「下午4点钟」就写「下午4点钟」，说「明天 21:00」就写「明天 21:00」。" +
+  "日期换算由程序完成，你换算反而会算错。" +
+  "只做改写，不要补充用户没说的信息，不要改动词句的意思。" +
+  "用户没说要提醒谁时，不要加 @ 对象。" +
+  `如果这句话根本不是要设提醒（例如在问提醒功能怎么用、在讨论别的），只输出 ${REMIND_NONE}，` +
+  "不要勉强凑一条。" +
+  "哨兵必须独占一行。" +
+  "你没有任何工具权限：不能读写文件、不能执行命令、不能操作 QQ。" +
+  "**绝不要声称已经设好了提醒**——你做不到，设提醒由程序在收到你的输出后完成。" +
+  "不存在授权弹窗：你不会得到任何新权限，不要请求对方批准，也不要重复尝试。";
+
 // 群管会话的附加提示词。与 user/robot 的根本区别：**它有工具**，而且是能
 // 踢人、禁言、发公告的工具。所以重点不在"怎么回答"，而在"别做多余的事"。
 //
@@ -165,7 +204,13 @@ export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPa
   // 这里的**白名单式**判断（而不是 `role !== "admin"`）是有意的：新角色默认
   // 掉进 admin 分支拿到 bypass 全权限，这是必须显式决定的，绝不能靠默认。
   const restrictedPrompt =
-    role === "user" ? USER_SYSTEM_PROMPT : role === "robot" ? ROBOT_SYSTEM_PROMPT : null;
+    role === "user"
+      ? USER_SYSTEM_PROMPT
+      : role === "robot"
+        ? ROBOT_SYSTEM_PROMPT
+        : role === "reminder"
+          ? REMINDER_SYSTEM_PROMPT
+          : null;
   const isModerator = role === "moderator";
   let args;
   if (restrictedPrompt) {
