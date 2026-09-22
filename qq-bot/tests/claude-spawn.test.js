@@ -109,8 +109,59 @@ test("未知 role 落到 admin 分支（新增角色必须显式加分支）", (
   // 记录的是**当前**行为：未知角色走 admin 分支拿到全权限。这是个危险的
   // 默认值，特意断言它是为了让"将来新增角色"这件事必须被显式面对——
   // 这条测试提醒你去 buildClaudeArgs 加一条分支，而不是让新角色默默拿到 bypass。
-  const args = buildClaudeArgs({ ...BASE, role: "moderator" });
+  //
+  // 示例值刻意用不存在的 "superuser"：曾经这里写的是 "moderator"，而 moderator
+  // 已经成了一条真实分支（有工具、无 bypass），拿它当"未知角色"会让这条测试
+  // 与真实行为脱节。换个不存在的名字，测的才是"未知"这个条件本身。
+  const args = buildClaudeArgs({ ...BASE, role: "superuser" });
   assert.ok(args.includes("--dangerously-skip-permissions"));
+});
+
+// ---------- moderator：群管会话 ----------
+//
+// 群管是唯一"有工具但不是 admin"的角色，所以它的参数是双向敏感的：
+// 少了白名单/MCP 就什么都做不了，多了 bypass 就等于把 admin 权限发出去。
+
+test("moderator 参数：绝不包含 bypass（安全回归红线）", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "moderator" });
+  assert.ok(
+    !args.includes("--dangerously-skip-permissions"),
+    "群管绝不能 bypass——bypass 会完全绕过 --allowedTools",
+  );
+});
+
+test("moderator 参数：走 default 权限模式（白名单只在 default 下生效）", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "moderator" });
+  const modeIdx = args.indexOf("--permission-mode");
+  assert.ok(modeIdx !== -1, "应包含 --permission-mode");
+  assert.equal(args[modeIdx + 1], "default");
+});
+
+test("moderator 参数：带 MCP 配置与白名单（否则群管没有工具可用）", () => {
+  const args = buildClaudeArgs({
+    ...BASE,
+    role: "moderator",
+    allowedTools: "mcp__onebot-http__set_group_ban",
+  });
+  assert.ok(args.includes("--mcp-config"), "应包含 --mcp-config");
+  assert.ok(args.includes("--strict-mcp-config"), "应包含 --strict-mcp-config");
+  const i = args.indexOf("--allowedTools");
+  assert.ok(i !== -1, "应包含 --allowedTools");
+  assert.equal(args[i + 1], "mcp__onebot-http__set_group_ban");
+});
+
+test("moderator 参数：附带群管提示词（不是 user/robot 那两份）", () => {
+  const promptOf = (args) => args[args.indexOf("--append-system-prompt") + 1];
+  const mod = buildClaudeArgs({ ...BASE, role: "moderator" });
+  assert.notEqual(promptOf(mod), promptOf(buildClaudeArgs({ ...BASE, role: "user" })));
+  assert.notEqual(promptOf(mod), promptOf(buildClaudeArgs({ ...BASE, role: "robot" })));
+});
+
+test("moderator 参数：缺白名单时抛错（不静默降级成无工具会话）", () => {
+  assert.throws(
+    () => buildClaudeArgs({ ...BASE, role: "moderator", allowedTools: undefined }),
+    /--allowedTools/,
+  );
 });
 
 // ---------- --model 透传 ----------

@@ -127,6 +127,37 @@ export function loadConfig() {
         "mcp__onebot-http__get_essence_msg_list",
       ].join(","),
 
+    // 群管会话的工具白名单。**按群内身份临时授予**，不是一种角色：
+    // 发送者在 roles.json 里（role 仍是 user），且 QQ 事件显示他在当前群是
+    // 群主/管理员时，才用这份名单跑一次独立会话。
+    //
+    // 与上面的 allowedTools 是**两套边界**，别混：上面那份是给 admin 会话的，
+    // 而 admin 走 bypass、白名单在 bypass 下完全失效（见 claude.js 注释）；
+    // 这份是给 moderator 会话的，走 default 模式，白名单**真实生效**。
+    //
+    // 含破坏性操作（踢人、全群禁言）是刻意选择：群管要的就是这些。护栏是
+    // 发送者的群内身份，以及独立会话——共享会话的白名单里永远没有这些工具，
+    // 所以权限不会被同一群里别人继承（见 moderator.js 文件头）。
+    moderatorTools:
+      env.QQ_MODERATOR_TOOLS ||
+      [
+        "Read",
+        "Glob",
+        "Grep",
+        // 查询类：模型得先把「张三」解析成 QQ 号，否则禁言/踢人都无从下手
+        "mcp__onebot-http__get_group_member_list",
+        "mcp__onebot-http__get_group_info",
+        "mcp__onebot-http__get_group_message_history",
+        // 管理类
+        "mcp__onebot-http__set_group_ban",
+        "mcp__onebot-http__set_group_whole_ban",
+        "mcp__onebot-http__set_group_kick",
+        "mcp__onebot-http__recall_message",
+        "mcp__onebot-http__send_group_notice",
+        "mcp__onebot-http__set_group_card",
+        "mcp__onebot-http__set_group_special_title",
+      ].join(","),
+
     // 群聊：默认关闭，开启后仅在 @机器人 时响应
     enableGroups: env.QQ_ENABLE_GROUPS === "true",
     groupMentionNames: (env.QQ_GROUP_MENTION_NAMES || "First")

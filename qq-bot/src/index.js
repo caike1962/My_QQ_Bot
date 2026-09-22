@@ -12,6 +12,7 @@ import { BG_PREFIX_RE, parseBgCommand, parseNaturalTrigger, setBgPath, setBgLogg
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
 import { formatHistory, historyBody } from "./history.js";
+import { detectGroupRole, isModeratorRequest, runModeratorAction } from "./moderator.js";
 import { loadRoles, removeUser, isUser, isRobot, isRobotPaused, pausedRobots, setRobotPaused, removeRobot, addUserWithMove, addRobotWithMove, setRolesPath } from "./roles.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
@@ -1486,6 +1487,60 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       done();
       return;
     }
+  }
+
+  // ---- 群管操作：按群内身份临时授予 QQ 管理工具 ----
+  //
+  // 不是新增角色。发送者在 roles.json 里（role 仍是 user），且他在**当前群**
+  // 是群主/管理员时，才允许这次操作。roles.json 不动，也不新增名单。
+  //
+  // 四个条件缺一不可：
+  //   role === "user"  —— admin 已有全权限（走 bypass），robot 不该有管理权。
+  //                       名单外的人根本到不了这里：shouldHandle 要求发送者
+  //                       角色非空，所以"群主但不在名单里"仍然被忽略。
+  //   isGroup          —— 私聊没有群可管。
+  //   detectGroupRole  —— QQ 事件里的 owner/admin，见 moderator.js 的说明。
+  //   isModeratorRequest —— 是不是在要求做管理操作，而不是普通聊天。
+  //
+  // 位置放在角色管理指令之后：同属权限类操作，归在一起便于审阅。
+  if (role === "user" && isGroup && detectGroupRole(event) !== "member" && isModeratorRequest(text)) {
+    log(`${key} 群管操作（${detectGroupRole(event)}）: ${truncate(text.replace(/\s+/g, " "), 40)}`);
+    try {
+      let historyLines = [];
+      try {
+        historyLines = await recentHistory(groupId, { isGroup: true });
+      } catch (error) {
+        log(`群管操作拉取群历史失败（不带历史继续）: ${error.message}`);
+      }
+
+      const result = await runModeratorAction({
+        text,
+        groupId,
+        config,
+        historyLines,
+        abortSignal,
+      });
+
+      // 投递分级复用现有那套（HTML 文件 / 截断 / 直发）。与模型路径一致：
+      // 群管会话同样可能回一大段说明，直接发会被 QQ 静默拒收。
+      const replyText = result.text || "操作已执行。";
+      const len = Array.from(replyText).length;
+      let sent;
+      if (shouldSendAsFile(len)) {
+        const ok = await sendLongReplyAsFile({ event, key, text: replyText, len });
+        sent = ok ? { status: "ok" } : await reply(truncatedReply(replyText, len));
+      } else {
+        sent = await reply(truncatedReply(replyText, len));
+      }
+      if (sent?.status !== "ok") log(`群管操作结果发送失败: ${JSON.stringify(sent)}`);
+    } catch (error) {
+      log(`群管操作失败: ${error.message}`);
+      await reply(`操作没能完成：${String(error.message).slice(0, 120)}`).catch((e) =>
+        log("发送失败: " + e.message),
+      );
+    }
+    done();
+    return;
   }
 
   // /提醒：定时提醒的增删查（仅 admin）。
