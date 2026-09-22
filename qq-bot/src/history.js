@@ -10,6 +10,11 @@
 // 体积是核心约束：实测原始 JSON 里一条转发段的 data.content 嵌着完整的历史
 // 消息数组，20 条消息的原始 JSON 有 12611 字符。全部塞进 prompt 是浪费——
 // 模型需要的是"谁在什么时候说了什么"，不是协议字段。提取后降到约 450 字符。
+//
+// 另外必须剥掉收尾哨兵（见 message.js 的 stripSilentEnd）：它是模型与代码之间
+// 的协议，历史里出现一个会让读到的模型以为"该收尾了"，把别人的收尾当自己的。
+
+import { stripSilentEnd } from "./message.js";
 
 // 各消息段类型的占位符。
 //
@@ -33,7 +38,7 @@ const SEGMENT_LABEL = {
 // 把一条消息渲染成 `[HH:MM] 谁: 说了什么`。
 //
 // 返回 null 表示这条没有可展示的内容（空消息），调用方跳过。
-export function formatHistoryLine(msg, { selfId } = {}) {
+export function formatHistoryLine(msg, { selfId, robots } = {}) {
   const text = messageText(msg);
   if (!text) return null;
 
@@ -42,7 +47,7 @@ export function formatHistoryLine(msg, { selfId } = {}) {
   const pad = (n) => String(n).padStart(2, "0");
   const stamp = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
-  return `[${stamp}] ${displayName(msg, selfId)}: ${text}`;
+  return `[${stamp}] ${displayName(msg, selfId, robots)}: ${text}`;
 }
 
 // 单条消息的正文。
@@ -51,7 +56,7 @@ function messageText(msg) {
   if (typeof segs === "string") {
     // 字符串形态是 CQ 码，这里极少出现（实测 NapCat 给的是数组），
     // 做最低限度的清理即可，不必实现完整的 CQ 解析。
-    return squeeze(segs.replace(/\[CQ:[^\]]*\]/g, "[非文本]"));
+    return squeeze(stripSilentEnd(segs.replace(/\[CQ:[^\]]*\]/g, "[非文本]")));
   }
   if (!Array.isArray(segs)) return "";
 
@@ -68,7 +73,7 @@ function messageText(msg) {
       out += SEGMENT_LABEL[seg.type] || "";
     }
   }
-  return squeeze(out);
+  return squeeze(stripSilentEnd(out));
 }
 
 // 压成一行。历史是按行读的，一条消息里夹换行会把结构冲散。
@@ -81,16 +86,29 @@ function squeeze(s) {
 //
 // 名字里的方括号和换行必须清掉：它们会伪造出第二个 `[HH:MM] 名字:` 标签，
 // 让模型以为那是另一个人说的另一条消息。
-function displayName(msg, selfId) {
+//
+// robots 里的号码加 `[机器人]` 前缀：模型在共享会话里分不清对面是人还是机器，
+// 而这两者该用完全不同的方式应对（对人要正常聊，对机器人要判断该不该收尾）。
+function displayName(msg, selfId, robots) {
   const raw = msg?.sender?.card || msg?.sender?.nickname || "";
   const name = String(raw)
     .replace(/[\[\]\r\n]/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 24);
-  if (name) return name;
+  const tag = isRobotSender(msg, robots) ? "[机器人] " : "";
+  if (name) return tag + name;
   const id = msg?.user_id ?? msg?.sender?.user_id;
-  return id !== undefined ? String(id) : (selfId === undefined ? "?" : "?");
+  return id !== undefined ? tag + id : "?";
+}
+
+// 历史里的这个发送者是不是名单里的机器人。selfId 天然被 formatHistory 过滤掉，
+// 这里不必再排除自己。
+function isRobotSender(msg, robots) {
+  if (!Array.isArray(robots) || !robots.length) return false;
+  const uid = Number(msg?.user_id ?? msg?.sender?.user_id);
+  if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+  return robots.some((r) => Number(r?.id) === uid);
 }
 
 // 把一批原始消息转成若干行。
@@ -101,7 +119,7 @@ function displayName(msg, selfId) {
 // 再重复一遍纯属浪费。
 //
 // selfId 比较一律转字符串：QQ 号有时是数字、有时是字符串，用 === 比会漏。
-export function formatHistory(messages, { selfId } = {}) {
+export function formatHistory(messages, { selfId, robots } = {}) {
   if (!Array.isArray(messages)) return [];
   const self = selfId === undefined || selfId === null ? null : String(selfId);
 
@@ -110,7 +128,7 @@ export function formatHistory(messages, { selfId } = {}) {
     if (!msg || typeof msg !== "object") continue;
     const uid = msg.user_id ?? msg.sender?.user_id;
     if (self !== null && uid !== undefined && String(uid) === self) continue;
-    const line = formatHistoryLine(msg, { selfId });
+    const line = formatHistoryLine(msg, { selfId, robots });
     if (line) lines.push(line);
   }
 

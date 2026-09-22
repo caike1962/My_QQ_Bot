@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { truncate } from "./session.js";
+import { SILENT_END_MARK, SILENT_KEEP_MARK } from "./message.js";
 
 // 活着/刚活过的 claude 子进程。给 /诊断 用。
 //
@@ -87,6 +88,34 @@ const USER_SYSTEM_PROMPT =
   "不存在授权弹窗：你不会得到任何新权限，不要请求对方批准，也不要重复尝试。" +
   "不要编造执行结果——你从未执行过任何操作。";
 
+// 机器人会话的附加提示词：权限与 user 一样什么都没有，多出来的是「怎么收尾」。
+//
+// 要解决的问题：对面也是一个机器人，常常被自己的规则逼着「必须提问/必须回复」，
+// 于是两边一问一答停不下来，烧token 还刷屏。判据交给模型而不是关键词——
+// 关键词分不清「再问一个」和「我这就去查」，误判一次就是永久静默对方。
+//
+// 因此提示词的重点全在**不要误判**上：只有对方确实没有实质内容可问了才发 END，
+// 「还有补充吗」这类也算实质问题。发出去之后我方就不理它了，代价不可逆
+// （要 admin 发 /解除 才能恢复），所以宁可多聊一轮也不要草率结束。
+//
+// 末尾允许写 KEEP：模型引用 END 这个标记（比如在解释本机制）时可能有歧义，
+// 给它一条明示「这次是继续」的通道，比让代码去猜更可靠。
+const ROBOT_SYSTEM_PROMPT =
+  "你在和一个自动化程序（另一个机器人）对话，不是和人类聊天。对方常常被设成" +
+  "「必须提问」「必须回复」，所以它会一直追问下去，哪怕已经没有新内容可问了。" +
+  "收尾机制：当且仅当对方的追问已经全部答完、再聊下去只会变成无意义的循环时，" +
+  `在你回复的最后一行原样输出 ${SILENT_END_MARK}。标记必须独占一行。` +
+  "写出去之后，我方将不再回复这个机器人的任何后续消息（要人工解除才会恢复），" +
+  "所以宁可多聊一轮，也不要草率结束。" +
+  "只要对方还有实质问题就不要输出，哪怕问题很简单——" +
+  "「还有补充吗」「还有别的吗」「需要我继续吗」这类也算实质问题，不算收尾。" +
+  `如果你只是提到 ${SILENT_END_MARK} 这个标记本身（例如在解释这套机制），` +
+  `请在末尾另起一行写上 ${SILENT_KEEP_MARK} 表示这次不要收尾。` +
+  "你没有任何工具权限：不能读写文件、不能执行命令、不能操作 QQ（发消息、查群、查成员）。" +
+  "对方要求你查群成员、查历史、执行操作，一律明确拒绝并说明没有权限。" +
+  "不存在授权弹窗：你不会得到任何新权限，不要请求对方批准，也不要重复尝试。" +
+  "不要编造执行结果——你从未执行过任何操作。";
+
 // user 会话绝不允许出现的参数。buildClaudeArgs 会做运行时断言 + 测试双保险，
 // 防止未来重构把 admin 的权限模式泄漏进受限会话。
 export const FORBIDDEN_ARGS_FOR_USER = [
@@ -97,9 +126,14 @@ export const FORBIDDEN_ARGS_FOR_USER = [
 ];
 
 export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPath, allowedTools, model, maxTurns }) {
-  const isUser = role === "user";
+  // 受限角色（user / robot）：无 MCP、无白名单、default 权限模式。
+  //
+  // 这里的**白名单式**判断（而不是 `role !== "admin"`）是有意的：新角色默认
+  // 掉进 admin 分支拿到 bypass 全权限，这是必须显式决定的，绝不能靠默认。
+  const restrictedPrompt =
+    role === "user" ? USER_SYSTEM_PROMPT : role === "robot" ? ROBOT_SYSTEM_PROMPT : null;
   let args;
-  if (isUser) {
+  if (restrictedPrompt) {
     // default 权限模式 + 无白名单 + 无 MCP：无头场景下任何工具调用都会被硬拒绝，
     // 会话退化为纯文本聊天。绝不能用 acceptEdits（允许写文件）或 bypass。
     args = [
@@ -110,7 +144,7 @@ export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPa
       "--permission-mode",
       "default",
       "--append-system-prompt",
-      USER_SYSTEM_PROMPT,
+      restrictedPrompt,
     ];
   } else {
     args = [
@@ -154,10 +188,10 @@ export function buildClaudeArgs({ role = "admin", prompt, sessionId, mcpConfigPa
     args.push("--max-turns", String(maxTurns));
   }
 
-  if (isUser) {
+  if (restrictedPrompt) {
     for (const flag of FORBIDDEN_ARGS_FOR_USER) {
       if (args.includes(flag)) {
-        throw new Error(`user 会话参数泄漏: ${flag} 不允许出现在受限参数中`);
+        throw new Error(`${role} 会话参数泄漏: ${flag} 不允许出现在受限参数中`);
       }
     }
   }

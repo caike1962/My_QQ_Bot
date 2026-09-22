@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, readdirSync, readSyn
 import { loadConfig } from "./config.js";
 import { OneBotWsClient } from "./onebot.js";
 import { runClaude, compactSession, ClaudeError, liveProcs } from "./claude.js";
-import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, reactionEmojiFor } from "./message.js";
+import { extractText, extractAts, extractFiles, shouldHandle, conversationKey, stripLeadingMention, isBotMentioned, senderRole, resolveRoleTarget, withSenderPrefix, parseResetCommand, parseStatusCommand, parseDiagnosticCommand, reactionEmojiFor, resolveRobotCommand, isPausedBypassCommand, parseSilentEnd } from "./message.js";
 import { sessionPath, stripImages, truncate, sessionCompleted, readSessionDelta, pendingSummary, sessionLineCount, lastRecordType, decideRecovery } from "./session.js";
 import { markQueued, markRunning, removePending, loadEntries, setQueueLogger, setQueuePath, markNotified, markMerging, markMergingAborted, markBaseline } from "./queue.js";
 import { shouldInterrupt, mergePrompt } from "./interrupt.js";
@@ -12,7 +12,7 @@ import { BG_PREFIX_RE, parseBgCommand, parseNaturalTrigger, setBgPath, setBgLogg
 import { buildDiagnostic } from "./diagnostics.js";
 import { renderReportHtml, reportFileName } from "./html-report.js";
 import { formatHistory, historyBody } from "./history.js";
-import { loadRoles, addUser, removeUser, isUser, setRolesPath } from "./roles.js";
+import { loadRoles, addUser, removeUser, isUser, isRobot, isRobotPaused, pausedRobots, setRobotPaused, addRobot, removeRobot, setRolesPath } from "./roles.js";
 
 const log = (...args) => console.error("[qq-bot]", ...args);
 setQueueLogger((msg) => log(msg));
@@ -301,7 +301,9 @@ async function recentHistory(id, { isGroup = true } = {}) {
       ? await client.action("get_group_msg_history", { group_id: Number(id) })
       : await client.action("get_private_message_history", { user_id: Number(id) });
     const msgs = res?.data?.messages ?? res?.data;
-    lines = formatHistory(msgs, { selfId: config.selfId });
+    // robots 传进去是为了给机器人发言人加 [机器人] 前缀：模型要知道对面
+    // 是自动化程序，才会用机器人那套判断（该不该收尾）而不是陪聊。
+    lines = formatHistory(msgs, { selfId: config.selfId, robots: loadRoles().robots });
   } catch (error) {
     log(`拉取 ${isGroup ? "群" : "私聊"} ${id} 历史失败（本次不带上下文）: ${error.message}`);
   }
@@ -1201,6 +1203,70 @@ async function resolveMentionedQq({ name, groupId }) {
   return Number(hits[0].user_id);
 }
 
+// 执行一条机器人名单指令并回执。
+//
+// 与「将 X 添加为用户」同一套写法：先写盘（commit 内部保证），成功才更新内存，
+// 失败原样抛出，由调用方捞回来告诉用户——不"假装成功"。
+async function applyRobotCommand({ action, qq, reply }) {
+  const okText = {
+    add: `已将 ${qq} 添加为机器人，我会在对话结束时自行收尾并不再回复它。`,
+    remove: `已将 ${qq} 移出机器人名单。`,
+    pause: `已暂停回复 ${qq}，之后它的消息一律忽略。`,
+    resume: `已恢复回复 ${qq}。`,
+  }[action];
+  const alreadyText = {
+    add: `${qq} 已在机器人名单中。`,
+    remove: `${qq} 不在机器人名单中。`,
+    pause: `${qq} 本来就处于暂停状态。`,
+    resume: `${qq} 本来就没暂停。`,
+  }[action];
+
+  let changed;
+  if (action === "add") changed = addRobot(qq);
+  else if (action === "remove") changed = removeRobot(qq);
+  else if (action === "pause") changed = setRobotPaused(qq, true);
+  else if (action === "resume") changed = setRobotPaused(qq, false);
+  else throw new Error(`未知的机器人指令: ${action}`);
+
+  await reply(changed ? okText : alreadyText);
+}
+
+// /解除：把暂停中的机器人放出来。
+//
+// 不带号码时扫当前会话——机器人（私聊）或群成员里所有暂停的机器人。
+// 这是"救回来"最短的路径：admin 未必记得号码，而机器人可能在任何会话里
+// 继续刷消息。
+async function handleUnpauseCommand({ cmd, isGroup, groupId, key, reply }) {
+  // 不带号码时直接遍历全部暂停中的机器人，比拉群成员列表更快、也不依赖
+  // NapCat 能不能返回完整列表。代价是本群之外的机器人也会被一起解除——
+  // 而"全放出来"本来就是 /解除 的语义（要精确控制就带号码）。
+  const scope = cmd.qq ? [cmd.qq] : pausedRobots();
+  const resumed = scope.filter((id) => isRobot(id) && setRobotPaused(id, false));
+
+  if (resumed.length) log(`解除机器人暂停 ${key}: ${resumed.join(",")}`);
+  await reply(
+    resumed.length
+      ? `已解除对 ${resumed.join("、")} 的回话暂停，它们再发消息我会正常回。`
+      : cmd.qq
+        ? `${cmd.qq} 当前不在暂停状态。`
+        : "当前没有处于暂停状态的机器人。",
+  );
+}
+
+// /机器人 列表：一眼看清名单和谁被静默了。
+async function handleRobotListCommand({ reply }) {
+  const robots = loadRoles().robots;
+  if (!robots.length) {
+    await reply(
+      "机器人名单为空。\n添加：「将 <QQ号 或 @某人> 添加为机器人」\n" +
+        "查看：/机器人 列表　暂停：/机器人 暂停 <QQ号>",
+    );
+    return;
+  }
+  const lines = robots.map((r, i) => `${i + 1}. ${r.id}${r.paused ? "（已暂停：不再回复它）" : ""}`);
+  await reply(`共 ${robots.length} 个机器人：\n${lines.join("\n")}\n\n解除暂停：/解除 <QQ号>（不带号则全部解除）`);
+}
+
 // 精确命令的直连执行通道。返回 true 表示本条消息已被消费，不应再送给模型。
 //
 // 这条路径不经过模型，直接调 OneBot API。保留它的理由：
@@ -1252,6 +1318,12 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   // 这条消息本身没有可执行的内容。
   const files = extractFiles(event.message);
   if (files.length) {
+    // 静默中的机器人连文件也不该得到回执——每个动作都算"回复"。
+    if (isRobotPaused(userId)) {
+      log(`${key} 来自已暂停的机器人，忽略其文件消息`);
+      done();
+      return;
+    }
     const total = files.reduce((s, f) => s + (f.size || 0), 0);
     // 通知文件消息也记进诊断活动：QQ 把文件和文字拆成两条，用户很可能
     // 紧接着就发文字，而"最后收到的是什么"正是诊断要回答的。
@@ -1273,6 +1345,25 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     return;
   }
 
+  // 身份判定（代码路径要用它做权限闸门，见下）。调用方没传 roles.isRobot 时
+  // 只可能是测试夹具，此时不会有人被当成机器人，行为退回改动前。
+  const role = senderRole(userId, config, roles);
+
+  // 「机器人」列表里**只能是机器人**——admin 不许进。
+  //
+  // 为什么必须显式拦：senderRole 把 admin 排在 robot 之上，所以一个同时是
+  // admin 的号码一旦被写进 robots（手滑、或者拿自己的号试机制），它的消息会
+  // 被当成机器人静默掉——包括 /诊断 /reset /提醒 这些救命的命令，只有 /解除
+  // 还能走。在入口把它登记回来，比让所有人去记"别把自己的号加进机器人"可靠。
+  //
+  // 认的是"已暂停至名单里的 admin"，不是"在名单里的 admin"：后者会在每条消息
+  // 上写盘，而且会踩掉手工写进 robots 的 paused=false（把 admin 变成停不下来的
+  // 机器人才是更怪的状态）。
+  if (role === "admin" && isRobotPaused(userId)) {
+    removeRobot(userId);
+    log(`${key} ${userId} 是 admin，不该在机器人名单里——已自动移出`);
+  }
+
   // 「继续」不是新指令，而是用户对一条**确定内容**的待重放消息的决定——
   // 合并它会让那条内容被改写（mergePrompt 会加前缀），而用户要的是
   // 原样重跑。放前面，before 「继续」被合并判据当成普通消息吃掉。
@@ -1281,10 +1372,63 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     return;
   }
 
+  // 机器人名单管理（仅 admin）。与「将 X 添加为用户」同款：权限操作走代码路径，
+  // 不能交给模型转述——它在工具被拒时会编造执行结果。
+  const robotCmd = resolveRobotCommand({ text });
+  if (robotCmd) {
+    // 全部是权限操作（加名单、改暂停状态），一律先过 admin 闸门。
+    // 放在解析号码之前：非 admin 发的指令不该触发任何群成员查询。
+    if (role !== "admin") {
+      await reply("你没有权限管理机器人名单。").catch((e) => log("发送权限提示失败: " + e.message));
+      done();
+      return;
+    }
+
+    try {
+      if (robotCmd.action === "unpause") {
+        await handleUnpauseCommand({ cmd: robotCmd, isGroup, groupId, key, reply });
+      } else if (robotCmd.action === "list") {
+        await handleRobotListCommand({ reply });
+      } else {
+        // target 表单要按名字反查号码；其余表单号码已在手上。
+        const qq = robotCmd.qq ?? (await resolveMentionedQq({ name: robotCmd.name, groupId }));
+        if (!qq) {
+          log(`无法解析「${robotCmd.name}」的 QQ 号，转交模型处理`);
+        } else if (qq === config.selfId) {
+          await reply(`${qq} 是我自己，不能把自己设成机器人。`);
+        } else {
+          await applyRobotCommand({ action: robotCmd.action, qq, reply });
+        }
+      }
+    } catch (error) {
+      log(`机器人名单操作失败: ${error.message}`);
+      await reply(`机器人名单操作失败：${String(error.message).slice(0, 120)}`).catch((e) =>
+        log("发送失败: " + e.message),
+      );
+    }
+    done();
+    return;
+  }
+
+  // ---- 已暂停的机器人：彻底静默 ----
+  //
+  // 位置在「继续」之后：若这个会话上有一条重启留下的待重放消息，用户/对方回
+  // 「继续」仍能把它放出来，不因为随后被暂停而丢掉。
+  //
+  // 静默 = 不回执、不贴表情、不进队列、不调模型。收尾那一轮已经告诉对方不再
+  // 回复了，再回一句"收到"就自相矛盾。
+  //
+  // /解除 与 /status 必须留出通道：前者是唯一的救回手段，后者的存在意义就是
+  // "现在到底怎么了"——机器人被静默了，你总得能问一句。两者都有各自的
+  // admin 闸门，放它们过去不会绕过权限。
+  if (isRobotPaused(userId) && !isPausedBypassCommand(text)) {
+    log(`${key} 来自已暂停的机器人（${userId}），本条静默忽略`);
+    done();
+    return;
+  }
+
   // 角色管理指令（仅 Admin 可执行）。拦截在模型路径之前：
-  // 加人/移除这种权限操作由代码确定性执行，不能交给模型转述
-  // （该模型在工具被拒时会"编造"执行结果，例如假装已写入名单）。
-  const role = senderRole(userId, config, roles);
+
   const roleCmd = resolveRoleTarget({
     text,
     mentionAts: ats,
@@ -1788,7 +1932,9 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
       allowedTools: config.allowedTools,
       timeoutMs: config.timeoutMs,
       mcpTimeoutMs: config.mcpTimeoutMs,
-      role,
+      // 对方是机器人时换用受限会话（无 MCP、无工具、带收尾提示词）。
+      // 人类与 admin 一律照旧——机器人名额不改变自己对会话的处理方式。
+      role: isRobot(userId) ? "robot" : role,
       model: config.claudeModel,
       abortSignal,
       // 诊断里显示"谁在哪问的什么"，比一整段合并前缀好读得多
@@ -1871,6 +2017,34 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
     saveSessions();
   }
 
+  // ---- 机器人收尾：模型在回复末尾写了 <<END>> ----
+  //
+  // 放在这里、后台判定**之前**：这一轮的文本要先被解析干净，后面三级发送
+  // 逻辑发的是剥掉哨兵的正文而不是原文。
+  //
+  // 是"先置暂停、再发正文"而不是反过来：两端之间隔着一个 setRobotPaused 的
+  // 同步写盘，哪怕对方在这一瞬间回了一条，也已被挡住——顺序反过来则存在
+  // 一个"正文已发出、暂停还没落盘"的窗口。
+  //
+  // 正文仍然要发：模型在这个位置写的通常是给对方机器人的明确答复
+  // （「都答完了，还有别的再问我」），把它吞掉反而像机器人挂了。
+  const silentEnd = parseSilentEnd(result.text);
+  // 只在**受限会话**（role=user 的聊友、或机器人）上剥哨兵：admin 会话里
+  // 模型提到这个标记是在聊机制本身（比如问"收尾标记是什么"），不该被悄悄吞掉。
+  // 机器人那一路必须剥——它收到收尾提示词后写的每个标记都是真协议。
+  const replyText = role === "admin" ? result.text : silentEnd.text;
+  if (silentEnd.end && isRobot(userId)) {
+    try {
+      setRobotPaused(userId, true);
+      log(`机器人 ${userId} 本轮收尾（${key}），已置为暂停——之后不再回复它。解除：/解除`);
+    } catch (error) {
+      // 写盘失败（文件被占用、磁盘满）不能拖垮这一轮：正文还没发出去，
+      // 抛出去会让条目留在 running，重启后变成一条假的「继续」待重放。
+      // 退化为"这次不暂停"——对方多问一轮，下次收尾时再试。
+      log(`置机器人 ${userId} 为暂停失败（本轮照常回复，下次收尾再试）: ${error.message}`);
+    }
+  }
+
   // 自然语言触发的后台任务：模型干到一半发现这活儿该转后台。
   //
   // 为什么在**执行后**才判断，而不是收到消息就拦：
@@ -1914,7 +2088,8 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
 
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
   await settle();
-  log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${truncate(result.text, 80)}`);
+  // 日志用 replyText：诊断里不该出现只对代码有意义的哨兵。
+  log(`回复 ${key}（${elapsed}s, $${result.cost.toFixed(4)}）: ${truncate(replyText, 80)}`);
 
   // 长回复的处理分三级，按"能完整送达"优先：
   //
@@ -1923,15 +2098,18 @@ async function handleMessage(event, entryId = null, abortSignal = null, preset =
   //   3. 阈值以下              → 照常发消息
   //
   // 长度按**码点**算：模型爱用 emoji，而 QQ 的限制也按字符算。
-  const len = Array.from(result.text).length;
+  //
+  // 一律发 replyText（受限会话已剥掉哨兵）而不是 result.text：
+  // 哨兵是模型与代码之间的协议，绝不能出现在对方收到的消息里。
+  const len = Array.from(replyText).length;
 
   let sent;
   if (shouldSendAsFile(len)) {
-    const ok = await sendLongReplyAsFile({ event, key, text: result.text, len });
+    const ok = await sendLongReplyAsFile({ event, key, text: replyText, len });
     // 文件失败时下面会走截断分支；成功则正文已经进文件了，不再重复发
-    sent = ok ? { status: "ok" } : await reply(truncatedReply(result.text, len));
+    sent = ok ? { status: "ok" } : await reply(truncatedReply(replyText, len));
   } else {
-    sent = await reply(truncatedReply(result.text, len));
+    sent = await reply(truncatedReply(replyText, len));
   }
 
   if (sent?.status !== "ok") {
@@ -2121,6 +2299,9 @@ function isDirectCommand(text) {
   // /bg 必须在这里认出来：认不出来的话，任务运行中发 /bg 会被合并打断吞掉、
   // 或者排到那条任务自己后面——恰恰在最需要它的时候失效。
   if (BG_PREFIX_RE.test(t)) return true;
+  // 机器人名单指令同理：/解除 在机器人被静默之后是唯一的救回手段，
+  // 排队等前面的任务跑完再执行就失去意义了。
+  if (resolveRobotCommand({ text: t })) return true;
   return resolveRoleTarget({ text: t, mentionAts: [], selfId: config.selfId }) !== null;
 }
 
@@ -2220,7 +2401,17 @@ function enqueue(event, { fromRetry = false, replayId = null } = {}) {
   //
   // 「继续」也不必在这里挡：handleRetry 早在 handleMessage 开头就把这种消息
   // 消费掉了，能走到这里的「继续」只可能是没有待重放条目的普通闲聊词。
-  if (!fromRetry && config.mergeInterrupt && !isDirectCommand(extractText(event.message))) {
+  //
+  // 再排除掉机器人：它们常成串地追问，而对方的"下一问"本来就该等我方跑完
+  // 这一轮再处理（合并是"打断重跑"，对一问一答的机器人语义不对）。
+  // canMerge 那边也拦得住（它只放行 admin/user），这里提前一步是为了不白算
+  // prompt 长度、不把排队条数撑起来。
+  if (
+    !fromRetry &&
+    config.mergeInterrupt &&
+    !isDirectCommand(extractText(event.message)) &&
+    !isRobot(Number(event.user_id))
+  ) {
     const exec = execs.get(key);
     // 第二段文本只算一次：既用于长度预判，也用于"空内容不合并"的判断。
     // 没有文本（纯图片、纯表情、@ 了但什么都没说）时不能合并——合并会把
@@ -2302,6 +2493,8 @@ log(
   `启动: bot=${config.selfId} 角色管理=开` +
     ` admin=[${config.allowedSenders.join(",") || "无(全部按 admin)"}]` +
     ` user=[${loadRoles().users.join(",") || "无"}]` +
+    ` robot=[${loadRoles().robots.map((r) => r.id).join(",") || "无"}]` +
+    ` 机器人暂停=[${pausedRobots().join(",") || "无"}]` +
     ` 群聊=${config.enableGroups ? "开" : "关"}${config.enableGroups ? `(群白名单=[${config.allowedGroups.join(",") || "全部"}], 会话=${config.groupSharedSession ? "按群共享" : "按群+人隔离"})` : " "}` +
     ` 回执=${config.ackMessage ? `开(延迟${config.ackDelayMs / 1000}s)` : "关"}` +
     ` 工具数=${config.allowedTools.split(",").length} 超时=${config.timeoutMs / 1000}s`,

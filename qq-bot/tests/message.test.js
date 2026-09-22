@@ -16,6 +16,10 @@ import {
   parseResetCommand,
   parseStatusCommand,
   parseDiagnosticCommand,
+  parseSilentEnd,
+  stripSilentEnd,
+  resolveRobotCommand,
+  isPausedBypassCommand,
 } from "../src/message.js";
 
 // ---------- extractText ----------
@@ -334,6 +338,171 @@ test("senderRole: 非法 user_id 返回 null", () => {
 test("senderRole: allowedSenders 为空时一律 admin（兼容遗留语义）", () => {
   const open = { allowedSenders: [] };
   assert.equal(senderRole(123456, open, ROLES), "admin");
+});
+
+// ---------- senderRole: robot ----------
+
+const ROBOT_ROLES = {
+  isUser: (id) => id === 88888888,
+  isRobot: (id) => id === 77777777,
+};
+
+test("senderRole: robots 名单内为 robot", () => {
+  assert.equal(senderRole(77777777, CONFIG, ROBOT_ROLES), "robot");
+});
+
+test("senderRole: admin 优先于 robot", () => {
+  const both = { isUser: () => false, isRobot: (id) => id === 1765116032 };
+  assert.equal(senderRole(1765116032, CONFIG, both), "admin");
+});
+
+// 漏传 isRobot 的调用点（例如测试夹具）必须退回 user，不能误判成机器人。
+test("senderRole: 未提供 isRobot 时退回 user 行为", () => {
+  assert.equal(senderRole(88888888, CONFIG, ROLES), "user");
+  assert.equal(senderRole(77777777, CONFIG, ROLES), null);
+});
+
+test("senderRole: robot 名单下非法 user_id 仍返回 null", () => {
+  for (const bad of [null, undefined, 0, -1, "abc", 1.5]) {
+    assert.equal(senderRole(bad, CONFIG, ROBOT_ROLES), null, `user_id=${bad}`);
+  }
+});
+
+// ---------- parseSilentEnd ----------
+
+test("parseSilentEnd: 无标记时 end=false 且文本原样", () => {
+  const r = parseSilentEnd("等于 6。还有什么想问的吗？");
+  assert.equal(r.end, false);
+  assert.equal(r.text, "等于 6。还有什么想问的吗？");
+});
+
+test("parseSilentEnd: 末尾独立一行的标记触发收尾并剥掉", () => {
+  const r = parseSilentEnd("等于 6。还有什么想问的吗？\n<<END>>");
+  assert.equal(r.end, true);
+  assert.equal(r.text, "等于 6。还有什么想问的吗？");
+});
+
+test("parseSilentEnd: 标记跟在正文同一行末尾也算（模型常这么写）", () => {
+  const r = parseSilentEnd("都答完了 <<END>>");
+  assert.equal(r.end, true);
+  assert.equal(r.text, "都答完了");
+});
+
+test("parseSilentEnd: 末尾带空行/空格仍触发", () => {
+  const r = parseSilentEnd("收工\n<<END>>\n  \n");
+  assert.equal(r.end, true);
+  assert.equal(r.text, "收工");
+});
+
+// 本机制的"宁可漏判"面：标记写在中间说明模型没听懂指令，
+// 此时停机代价太大（永久静默对方），必须放过这一轮。
+test("parseSilentEnd: 标记在中间不触发，但仍会被剥掉", () => {
+  const r = parseSilentEnd("<<END>> 这个标记是收尾用的");
+  assert.equal(r.end, false);
+  assert.equal(r.text, "这个标记是收尾用的");
+});
+
+test("parseSilentEnd: 末尾是 KEEP 时不收尾（覆盖中间提到的 END）", () => {
+  const r = parseSilentEnd("如果该收尾就写 <<END>>\n<<KEEP>>");
+  assert.equal(r.end, false);
+  assert.equal(r.text, "如果该收尾就写");
+});
+
+test("parseSilentEnd: 两个标记写在同一行不触发收尾", () => {
+  const r = parseSilentEnd("说明 <<END>> <<KEEP>>");
+  assert.equal(r.end, false);
+});
+
+test("parseSilentEnd: 空输入与 null 不抛错", () => {
+  for (const bad of ["", null, undefined, 123]) {
+    const r = parseSilentEnd(bad);
+    assert.equal(r.end, false);
+    assert.equal(typeof r.text, "string");
+  }
+});
+
+test("parseSilentEnd: 只剥标记、不动正文里的其它空白", () => {
+  const r = parseSilentEnd("第一行\n\n第二行\n<<END>>");
+  assert.equal(r.end, true);
+  assert.equal(r.text, "第一行\n\n第二行");
+});
+
+test("stripSilentEnd: 剥掉正文里出现的所有标记", () => {
+  assert.equal(stripSilentEnd("a<<END>>b<<KEEP>>c"), "abc");
+});
+
+// ---------- resolveRobotCommand ----------
+
+test("resolveRobotCommand: 声明式添加/移出（号码）", () => {
+  assert.deepEqual(resolveRobotCommand({ text: "将 22334455 添加为机器人" }), {
+    form: "target",
+    action: "add",
+    qq: 22334455,
+    name: null,
+  });
+  assert.deepEqual(resolveRobotCommand({ text: "将 22334455 移出机器人" }), {
+    form: "target",
+    action: "remove",
+    qq: 22334455,
+    name: null,
+  });
+});
+
+test("resolveRobotCommand: 声明式带名字时 qq 为 null 交给下游反查", () => {
+  const r = resolveRobotCommand({ text: "将@小冰 添加为机器人" });
+  assert.equal(r.action, "add");
+  assert.equal(r.qq, null);
+  assert.equal(r.name, "小冰");
+});
+
+test("resolveRobotCommand: /机器人 列表 与空参数等价", () => {
+  assert.equal(resolveRobotCommand({ text: "/机器人" }).action, "list");
+  assert.equal(resolveRobotCommand({ text: "/机器人 列表" }).action, "list");
+});
+
+test("resolveRobotCommand: /机器人 暂停|恢复|添加|移出 <号码>", () => {
+  assert.equal(resolveRobotCommand({ text: "/机器人 暂停 22334455" }).action, "pause");
+  assert.equal(resolveRobotCommand({ text: "/机器人 暂停 22334455" }).qq, 22334455);
+  assert.equal(resolveRobotCommand({ text: "/机器人 恢复 22334455" }).action, "resume");
+  assert.equal(resolveRobotCommand({ text: "/机器人 添加机器人 22334455" }).action, "add");
+  assert.equal(resolveRobotCommand({ text: "/机器人 移出 22334455" }).action, "remove");
+});
+
+// 漏了号码时不能返回 qq=null 的 pause——那会让下游去猜要暂停谁。
+test("resolveRobotCommand: /机器人 暂停（无号码）返回 null 交给模型", () => {
+  assert.equal(resolveRobotCommand({ text: "/机器人 暂停" }), null);
+  assert.equal(resolveRobotCommand({ text: "/机器人 恢复机器人" }), null);
+});
+
+test("resolveRobotCommand: /解除 与 /解除 <号码>", () => {
+  assert.deepEqual(resolveRobotCommand({ text: "/解除" }), { form: "verbose", action: "unpause", qq: null });
+  const withQq = resolveRobotCommand({ text: "/解除 22334455" });
+  assert.equal(withQq.action, "unpause");
+  assert.equal(withQq.qq, 22334455);
+});
+
+test("resolveRobotCommand: 非指令文本一律 null（不能误吞普通聊天）", () => {
+  for (const t of ["", "你好", "机器人在吗", "/机器人手册", "将 123 添加为用户", "/诊断"]) {
+    assert.equal(resolveRobotCommand({ text: t }), null, `text=${t}`);
+  }
+});
+
+// ---------- isPausedBypassCommand ----------
+
+test("isPausedBypassCommand: /解除 与 /status 放行，其余一律拦", () => {
+  assert.equal(isPausedBypassCommand("/解除"), true);
+  assert.equal(isPausedBypassCommand("/解除 22334455"), true);
+  assert.equal(isPausedBypassCommand("/status"), true);
+  assert.equal(isPausedBypassCommand("/状态"), true);
+  assert.equal(isPausedBypassCommand("你好"), false);
+  assert.equal(isPausedBypassCommand("/机器人 列表"), false);
+  assert.equal(isPausedBypassCommand("/解除暂停"), false);
+});
+
+// 用户名单的声明式指令不能因为新加了机器人名单而被误解
+test("resolveRobotCommand: 「添加为机器人」不会被用户名单指令吃掉", () => {
+  assert.equal(parseRoleCommand("将 22334455 添加为机器人"), null);
+  assert.equal(resolveRoleTarget({ text: "将 22334455 添加为机器人", mentionAts: [], selfId: 1 }), null);
 });
 
 test("shouldHandle: user 名单内私聊通过", () => {

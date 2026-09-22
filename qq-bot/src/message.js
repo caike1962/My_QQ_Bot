@@ -211,15 +211,94 @@ export function parseDiagnosticCommand(text) {
   return DIAGNOSTIC_RE.test((text || "").trim());
 }
 
-// 发送者角色：admin（QQ_ALLOWED_SENDERS，现状语义不变）、user（roles.json 名单）、null（陌生人）。
+// 发送者角色：admin（QQ_ALLOWED_SENDERS，现状语义不变）、user（roles.json 的 users 名单）、
+// robot（roles.json 的 robots 名单——对方也是个机器人，走受限会话 + 收尾即静默）、null（陌生人）。
 // 兼容遗留语义：allowedSenders 为空（= 不限制）时一律按 admin 处理。
+//
+// 不传 roles.isRobot 的调用点（测试夹具就是这种）会自然退回 user 行为，不会误判成机器人。
 export function senderRole(userId, config, roles = {}) {
   const id = Number(userId);
   if (config.allowedSenders.length) {
     if (config.allowedSenders.includes(id)) return "admin";
+    if (roles.isRobot?.(id)) return "robot";
     return roles.isUser?.(id) ? "user" : null;
   }
   return "admin";
+}
+
+// ---- 收尾哨兵（<<END>> / <<KEEP>>）----
+//
+// 机器人角色专用。对方是另一个机器人时，典型的坑是它被设成"必须提问/必须回复"，
+// 于是两边一问一答永远停不下来。判据交给模型（关键词命中太容易误判），
+// 但模型得有一条能传给代码的信号通道——就是在回复末尾原样写出这个哨兵。
+//
+// 哨兵必须满足两点：模型不会自然地写出它（所以用带尖括号的 ASCII 串，
+// 而不是「再见」这类词），以及出现在**末尾**才算数（正文中间提到哨兵本身
+// ——比如两个机器人在讨论本机制——不该触发收尾）。
+//
+// 两个方向各一个标记：END=该收尾了，KEEP=还有实质内容、继续聊。
+// KEEP 的存在是为了让"收到含标记的历史消息"这种边界有确定行为：
+// 模型引用某个标记时能顺手声明"这只是引用"，而不是靠代码去猜它的意图。
+//
+// 用 `<<END>>` 而不是 HTML 注释：它更短、令牌更省，且回复走 HTML 文件
+// 那一路时不会在渲染层被注释掉。
+
+// ---- 收尾哨兵（<<END>> / <<KEEP>>）----
+//
+// 机器人角色专用。对方是另一个机器人时，典型的坑是它被设成"必须提问/必须回复"，
+// 于是两边一问一答永远停不下来。判据交给模型（关键词命中太容易误判），
+// 但模型得有一条能传给代码的信号通道——就是在回复末尾原样写出这个哨兵。
+//
+// 哨兵必须满足两点：模型不会自然地写出它（所以用带尖括号的 ASCII 串，
+// 而不是「再见」这类词），以及出现在**末尾**才算数（正文中间提到哨兵本身
+// ——比如两个机器人在讨论本机制——不该触发收尾）。
+//
+// 两个方向各一个标记：END=该收尾了，KEEP=还有实质内容、继续聊。
+// KEEP 的存在是为了让"收到含标记的历史消息"这种边界有确定行为：
+// 模型引用某个标记时能顺手声明"这只是引用"，而不是靠代码去猜它的意图。
+//
+// 用 `<<END>>` 而不是 HTML 注释：它更短、令牌更省，且回复走 HTML 文件
+// 那一路时不会在渲染层被注释掉。
+export const SILENT_END_MARK = "<<END>>";
+export const SILENT_KEEP_MARK = "<<KEEP>>";
+
+// 标记必须在行尾。模型写进一行中间时（引用、代码块里演示），
+// 那多半是在谈论机制而不是执行机制，锚定到行尾能挡掉这类误判。
+function markerAtEnd(raw, mark) {
+  const literal = mark.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`${literal}[ \\t]*\\s*$`).test(raw);
+}
+
+// 给模型看的说明在 claude.js，这里只管判据，两边共用一个常量避免写岔。
+//
+// 剥除是全局的（标记写在哪里都拿掉），触发判定是锚定的：
+// 若模型把标记写在开头又写了正文，那是它没听懂，此时**不该**停机——
+// 停机的代价是"以后再不理对方"，宁可漏判一次让它多聊一轮。
+// 同理，末尾是 KEEP 时一律不停（覆盖"中间提过 END、末尾声明继续"的写法）。
+//
+// 刻意**不导出**：调用方只需知道"这轮要不要收尾"+"干净正文是什么"，
+// 把两个标记暴露出去只会诱使别处各写一份判据。
+export function parseSilentEnd(text) {
+  const raw = String(text ?? "");
+  const end = markerAtEnd(raw, SILENT_END_MARK) && !markerAtEnd(raw, SILENT_KEEP_MARK);
+  return { end, text: stripSilentEnd(raw) };
+}
+
+// 剥掉全部标记及其独占的空白行。历史渲染、以及发给用户的正文都要过这一道：
+// 哨兵绝不该出现在任何给人看、给模型读的文本里。
+//
+// 先按行处理去掉"整行只有标记"的行，再对行内残留做兜底剥离——
+// 后者只在模型没按格式写时才会命中，兜底掉比把它原样发给对方好。
+export function stripSilentEnd(text) {
+  return String(text ?? "")
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      return t !== SILENT_END_MARK && t !== SILENT_KEEP_MARK;
+    })
+    .join("\n")
+    .replace(/<<END>>|<<KEEP>>/g, "")
+    .trim();
 }
 
 // Admin 专属的权限管理指令。走代码路径而非模型路径：
@@ -301,6 +380,69 @@ export function resolveRoleTarget({ text, mentionAts = [], selfId }) {
   // 意图成立但既没有号码也没有可查的名字（例如「将  添加为用户」），
   // 交给调用方退回模型路径去问清楚。
   return { action, qq: null, name: null };
+}
+
+// ---- 机器人名单管理指令 ----
+//
+// 两种写法，对应两个真实需求：
+//
+//   1. 声明式「将 <目标> 添加为机器人」——人在群里、手上有号码或 at 段，
+//      与「将 X 添加为用户」保持一致的语法，不让人记第二套。这种交给
+//      index.js 复用 resolveMentionedQq 的三级解析（号码 → at 段 → 名字）。
+//   2. 表单式「/机器人 列表 | 添加 123 | 暂停 123 | 恢复 123」——管理的是
+//      状态而不是成员，手上有号码时写成一行最短。
+//
+// 两条都不带号码目标时（如「/机器人 暂停」）返回 null 交给模型去问清楚：
+// 返回一个 qq=null 的 pause 让下游去猜要暂停谁，比多烧一轮上下文危险得多。
+//
+// 为什么另开 /解除 而不是只给「/机器人 恢复」：机器人被静默后可能在任何会话里
+// 继续发消息，admin 未必记得号码。不带参数的 /解除 扫当前会话，把里面所有暂停
+// 的机器人都放出来——这是"救回来"这个动作最短的路径，也是收尾提示里给对方的写法。
+const ROBOT_ADD_VERBOSE_RE = /^将\s*(?:(\d{5,12})\b|@?([^@\s]{1,24}?))\s*添加为\s*机器人$/;
+const ROBOT_DEL_VERBOSE_RE = /^将\s*(?:(\d{5,12})\b|@?([^@\s]{1,24}?))\s*移出\s*机器人$/;
+
+// `/解除`、`/解除 123456` 都认。
+const UNPAUSE_RE = /^\/解除(?:\s+(\d{5,12}))?$/;
+
+export function resolveRobotCommand({ text } = {}) {
+  const t = (text || "").trim();
+  if (!t) return null;
+
+  const unpause = t.match(UNPAUSE_RE);
+  if (unpause) return { form: "verbose", action: "unpause", qq: unpause[1] ? Number(unpause[1]) : null };
+
+  const form = t.match(/^\/机器人\s*(.*)$/);
+  if (form === null) {
+    // 声明式：与「将 X 添加为用户」同款，号码与名字两种写法。
+    // 路由走 target 表（由 index.js 复用 resolveMentionedQq 按名字反查号码），
+    // 与 /机器人 添加 <号> 这种手上有号码的表单式分开。
+    let m = t.match(ROBOT_ADD_VERBOSE_RE);
+    if (m) return { form: "target", action: "add", qq: m[1] ? Number(m[1]) : null, name: m[2] || null };
+    m = t.match(ROBOT_DEL_VERBOSE_RE);
+    if (m) return { form: "target", action: "remove", qq: m[1] ? Number(m[1]) : null, name: m[2] || null };
+    return null;
+  }
+
+  const body = form[1].trim();
+  if (body === "" || body === "列表") return { form: "list", action: "list", qq: null };
+
+  const verb = body.match(/^(暂停|恢复|添加|移出)(?:机器人)?\s+(\d{5,12})$/);
+  if (verb) {
+    const map = { 暂停: "pause", 恢复: "resume", 添加: "add", 移出: "remove" };
+    return { form: "verbose", action: map[verb[1]], qq: Number(verb[2]) };
+  }
+
+  // 「/机器人 暂停」这种漏了号码的写法不认——交给模型去问清楚，
+  // 比返回一个 qq=null 的 pause 让它去猜要安全。
+  return null;
+}
+
+// 已暂停的机器人还允许走完的消息：/解除（唯一的救回手段）与 /status（"现在
+// 到底怎么了"——机器人被静默了总得能问一句）。两者各自的 admin 闸门都在
+// 更下游，放它们过来不会绕过权限。
+export function isPausedBypassCommand(text) {
+  const t = (text || "").trim();
+  return UNPAUSE_RE.test(t) || /^\/(?:status|状态)$/.test(t);
 }
 
 export function shouldHandle(event, config, roles = {}) {

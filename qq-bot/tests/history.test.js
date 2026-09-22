@@ -210,6 +210,85 @@ test("formatHistory: 损坏的条目被跳过，不影响其他条目", () => {
   assert.ok(out.some((l) => /好/.test(l)), "合法条目应保留");
 });
 
+// ---------- 机器人标注 ----------
+
+const ROBOTS = [{ id: 77777777, paused: false }];
+
+test("formatHistoryLine: robots 名单里的发送者带 [机器人] 前缀", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 77777777, sender: { card: "小冰" }, message: [{ type: "text", data: { text: "1+1等于几？" } }] },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.match(line, /\[机器人\] 小冰: /, "模型要能一眼看出对面是自动化程序");
+});
+
+test("formatHistoryLine: 人类发送者不带前缀", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 1, sender: { card: "张总" }, message: [{ type: "text", data: { text: "早" } }] },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.ok(!line.includes("[机器人]"));
+});
+
+test("formatHistoryLine: 不传 robots 时行为与改动前完全一致", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 77777777, sender: { card: "小冰" }, message: [{ type: "text", data: { text: "x" } }] },
+    { selfId: 999 },
+  );
+  assert.ok(!line.includes("[机器人]"));
+});
+
+test("formatHistoryLine: 机器人没有昵称时退回号码但保留前缀", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 77777777, sender: {}, message: [{ type: "text", data: { text: "x" } }] },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.match(line, /\[机器人\] 77777777: /);
+});
+
+test("formatHistoryLine: 号码是字符串形式也能匹配上", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: "77777777", sender: { card: "小冰" }, message: [{ type: "text", data: { text: "x" } }] },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.match(line, /\[机器人\] /);
+});
+
+test("formatHistoryLine: [机器人] 前缀不破坏标签结构（只有时间戳一对方括号）", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 77777777, sender: { card: "小冰" }, message: [{ type: "text", data: { text: "x" } }] },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.equal((line.match(/\[/g) || []).length, 2, "时间戳 + [机器人] 各一对方括号");
+  assert.match(line, /^\[\d{2}:\d{2}\] \[机器人\] 小冰: x$/);
+});
+
+test("formatHistoryLine: 正文里的收尾哨兵被剥掉", () => {
+  // 哨兵是模型与代码之间的协议。它出现在历史里会让读到的模型
+  // 以为"该收尾了"——把别人的收尾当成自己的。
+  const line = formatHistoryLine(
+    {
+      time: T(10, 0),
+      user_id: 77777777,
+      sender: { card: "小冰" },
+      message: [{ type: "text", data: { text: "都答完了\n<<END>>" } }],
+    },
+    { selfId: 999, robots: ROBOTS },
+  );
+  assert.ok(!line.includes("<<END>>"), "历史里不该出现哨兵");
+  assert.ok(!line.includes("<<KEEP>>"));
+  assert.match(line, /都答完了/);
+});
+
+test("formatHistoryLine: 字符串形态（CQ 码）的正文也剥哨兵", () => {
+  const line = formatHistoryLine(
+    { time: T(10, 0), user_id: 1, sender: { card: "甲" }, message: "收工 <<END>>" },
+    { selfId: 999 },
+  );
+  assert.ok(!line.includes("<<END>>"));
+  assert.match(line, /收工/);
+});
+
 // ---------- historyBody ----------
 
 test("historyBody: 包成一段带说明的文字，并标明是最近的记录", () => {

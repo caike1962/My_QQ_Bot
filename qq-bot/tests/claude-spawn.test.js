@@ -58,6 +58,61 @@ test("防呆清单：FORBIDDEN_ARGS_FOR_USER 完整覆盖已知泄漏面", () =>
   assert.doesNotThrow(() => buildClaudeArgs({ ...BASE, role: "user" }));
 });
 
+// ---------- robot 角色 ----------
+
+// 关键回归：role 是**白名单式**判断（user/robot 各一条分支），不是
+// `role !== "admin"`。后者会让任何新角色默默掉进 admin 分支拿到 bypass 全权限，
+// 这几条测试就是拦这个的。
+test("robot 参数：绝不包含任何危险 flag（安全回归红线）", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "robot" });
+  for (const flag of FORBIDDEN_ARGS_FOR_USER) {
+    assert.ok(!args.includes(flag), `robot 参数不应包含 ${flag}`);
+  }
+});
+
+test("robot 参数：走 default 权限模式，不带 MCP", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "robot" });
+  const modeIdx = args.indexOf("--permission-mode");
+  assert.ok(modeIdx !== -1, "应包含 --permission-mode");
+  assert.equal(args[modeIdx + 1], "default", "权限模式必须是 default（不是 acceptEdits/bypass）");
+  assert.ok(!args.includes("--mcp-config"), "robot 会话不给 MCP");
+  assert.ok(!args.includes("--allowedTools"), "robot 会话不挂白名单");
+});
+
+test("robot 参数：附带机器人提示词（含收尾哨兵说明）", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "robot" });
+  const promptIdx = args.indexOf("--append-system-prompt");
+  assert.ok(promptIdx !== -1, "应包含 --append-system-prompt");
+  const prompt = args[promptIdx + 1];
+  assert.match(prompt, /自动化程序/, "提示词应说明对方是机器人");
+  assert.ok(prompt.includes("<<END>>"), "提示词应给出收尾标记的写法");
+  assert.ok(prompt.includes("<<KEEP>>"), "提示词应给出「这次不收尾」的写法");
+  assert.match(prompt, /没有任何工具权限/, "提示词应声明无权限");
+});
+
+test("robot 参数：提示词与 user 的纯聊天提示词不是同一份", () => {
+  const robot = buildClaudeArgs({ ...BASE, role: "robot" });
+  const user = buildClaudeArgs({ ...BASE, role: "user" });
+  assert.notEqual(
+    robot[robot.indexOf("--append-system-prompt") + 1],
+    user[user.indexOf("--append-system-prompt") + 1],
+  );
+});
+
+test("robot 参数：会话 resume 照常保留", () => {
+  const args = buildClaudeArgs({ ...BASE, role: "robot" });
+  assert.ok(args.includes("--resume"), "robot 会话也应支持 resume");
+  assert.equal(args[args.indexOf("--resume") + 1], "abc123");
+});
+
+test("未知 role 落到 admin 分支（新增角色必须显式加分支）", () => {
+  // 记录的是**当前**行为：未知角色走 admin 分支拿到全权限。这是个危险的
+  // 默认值，特意断言它是为了让"将来新增角色"这件事必须被显式面对——
+  // 这条测试提醒你去 buildClaudeArgs 加一条分支，而不是让新角色默默拿到 bypass。
+  const args = buildClaudeArgs({ ...BASE, role: "moderator" });
+  assert.ok(args.includes("--dangerously-skip-permissions"));
+});
+
 // ---------- --model 透传 ----------
 //
 // 模型由 cc-switch 按槽位路由，传的必须是别名（haiku/sonnet/opus）。
